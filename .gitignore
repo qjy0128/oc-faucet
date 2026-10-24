@@ -1,0 +1,13 @@
+node_modules/
+release/
+*.log
+data/
+
+# Computer Use 的中间过程截图，不进仓库（成品的证据图挑进 docs/证据/）
+.dsh-computer-use/
+.tmp-test-data/
+# 工单/规格草稿等过程产物
+.scratch/
+# ZCode 自己的会话目录，同 .dsh-computer-use 的待遇
+.zcode/
+dist/

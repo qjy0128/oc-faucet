@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'">
+  <meta name="color-scheme" content="light dark">
+  <title>OC Faucet</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="shell">
+
+    <!-- 顶栏：品牌 + 当前状态 + 主题 -->
+    <header class="topbar">
+      <div class="brand">
+        <img src="icon.png" alt="" width="30" height="30">
+        <div class="brand-text">
+          <h1>OC Faucet</h1>
+        </div>
+      </div>
+
+      <div class="topbar-spacer"></div>
+
+      <span id="chip" class="status-chip" data-state="busy" role="status" aria-live="polite">
+        <span class="pulse" aria-hidden="true"></span>
+        <span id="chip-text">正在启动</span>
+      </span>
+
+      <div class="segmented" role="group" aria-label="界面主题">
+        <button id="theme-system" type="button" data-theme-choice="system" aria-pressed="true" title="跟随系统">系统</button>
+        <button id="theme-light" type="button" data-theme-choice="light" aria-pressed="false" title="浅色">浅色</button>
+        <button id="theme-dark" type="button" data-theme-choice="dark" aria-pressed="false" title="深色">深色</button>
+      </div>
+    </header>
+
+    <main class="main">
+
+      <!-- 三个数字 -->
+      <dl class="stats" aria-label="模型统计">
+        <div class="stat" data-kind="total">
+          <dt>已发现</dt>
+          <dd id="n-total">0</dd>
+        </div>
+        <div class="stat" data-kind="available">
+          <dt>可用</dt>
+          <dd id="n-usable">0</dd>
+        </div>
+        <div class="stat" data-kind="pending">
+          <dt>待检测</dt>
+          <dd id="n-pending">0</dd>
+        </div>
+      </dl>
+
+      <!-- 动作 -->
+      <div class="actions">
+        <button id="act-read" class="btn" type="button" disabled>
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M16 10a6 6 0 1 1-1.8-4.3M16 3v4h-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>读取模型</span>
+        </button>
+        <button id="act-test" class="btn" type="button" disabled>
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M2 10h3.5l2-5.5L12 15.5l2-5.5h4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>检测全部</span>
+        </button>
+        <button id="act-retest" class="btn" type="button" disabled title="忽略缓存，全部重新实测（会多花一些免费额度）">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M10 4.5v3m0 5v3M4.5 10h3m5 0h3M6.2 6.2l2.1 2.1m3.4 3.4 2.1 2.1m0-7.6-2.1 2.1m-3.4 3.4-2.1 2.1" stroke-linecap="round"/></svg>
+          <span>强制重测</span>
+        </button>
+      </div>
+
+      <!-- 模型清单 -->
+      <section class="card" aria-labelledby="list-title">
+        <div class="card-head">
+          <h2 id="list-title">模型清单</h2>
+          <span class="hint" id="list-hint">点一行看详情；左边的小按钮只重测这一个</span>
+        </div>
+
+        <div id="notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+
+        <div class="list" id="list" tabindex="0" role="region" aria-label="可滚动的模型清单" aria-describedby="list-hint">
+          <div class="list-head" aria-hidden="true">
+            <span></span>
+            <span>模型</span>
+            <span>能力</span>
+            <span>状态</span>
+            <span class="col-timing">耗时</span>
+          </div>
+          <div id="rows"></div>
+        </div>
+      </section>
+
+      <!-- 一键接入：把可用模型写进各个 AI 编程工具；每个目标一行，状态实读对方配置文件 -->
+      <section class="card targets-card" aria-labelledby="targets-title">
+        <div class="card-head">
+          <h2 id="targets-title">一键接入</h2>
+          <span class="hint">写入只碰我们标记的条目，你手写的配置一条不动；没装的工具按钮是灰的</span>
+        </div>
+        <div id="targets" class="targets"></div>
+      </section>
+    </main>
+
+    <!-- 底部：说明与设置 + 服务状态 -->
+    <footer class="foot">
+      <div class="foot-info">
+        <details id="info">
+          <summary>
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 9.2v4.6M10 6.4v.2" stroke-linecap="round"/></svg>
+            <span>说明与设置</span>
+          </summary>
+          <div class="foot-body">
+            <p class="foot-note">
+              检测会真的向上游发一次请求，用掉一点免费额度；通过只说明"这一次按协议给出了动作"，不等于每次都稳。
+              耗时是整轮请求的用时，不是首字延迟。额度剩多少上游不告诉我们，这里也查不到。
+              没通过检测的模型只留在这个窗口里看，不会写进任何工具。
+            </p>
+
+            <div class="settings">
+              <label for="cfg-concurrency">检测并发</label>
+              <input id="cfg-concurrency" type="number" min="1" max="6" step="1">
+              <label for="cfg-ttl">判定有效期（分钟）</label>
+              <input id="cfg-ttl" type="number" min="1" step="30">
+              <button id="cfg-save" class="mini" type="button">保存</button>
+              <span class="actions-spacer"></span>
+              <button id="act-config-path" class="mini" type="button">配置文件在哪</button>
+              <button id="act-log-path" class="mini" type="button">请求日志在哪</button>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div class="statusbar" id="statusbar" data-state="busy">
+        <span class="lead"><span class="dot" aria-hidden="true"></span><span id="status-text">正在启动隔离的 OpenCode</span></span>
+        <span id="status-progress" class="fact" hidden></span>
+        <span class="fact fact-copy"><span>转发口</span><span id="fact-endpoint">尚未启动</span><button id="act-copy-endpoint" class="copy-btn" type="button" disabled title="复制 BaseURL，形如 http://127.0.0.1:41982"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 7.5h5.5A1.5 1.5 0 0 1 15 9v5.5a1.5 1.5 0 0 1-1.5 1.5H8A1.5 1.5 0 0 1 6.5 14.5V9A1.5 1.5 0 0 1 8 7.5z"/><path d="M11 7.5V5A1.5 1.5 0 0 0 9.5 3.5H5A1.5 1.5 0 0 0 3.5 5v4.5A1.5 1.5 0 0 0 5 11h1.5"/></svg><span>复制</span></button></span>
+        <span class="fact fact-copy"><span>密钥</span><span id="fact-key">●●●●●●</span><input id="key-input" type="text" hidden spellcheck="false" autocomplete="off" placeholder="输入新密钥"><button id="act-key-show" class="copy-btn" type="button" title="在打码和明文之间切换"><span>显示</span></button><button id="act-key-copy" class="copy-btn" type="button" title="复制明文密钥"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 7.5h5.5A1.5 1.5 0 0 1 15 9v5.5a1.5 1.5 0 0 1-1.5 1.5H8A1.5 1.5 0 0 1 6.5 14.5V9A1.5 1.5 0 0 1 8 7.5z"/><path d="M11 7.5V5A1.5 1.5 0 0 0 9.5 3.5H5A1.5 1.5 0 0 0 3.5 5v4.5A1.5 1.5 0 0 0 5 11h1.5"/></svg><span>复制</span></button><button id="act-key-edit" class="copy-btn" type="button" title="换一个新密钥，已写入的工具会跟着同步"><span>编辑</span></button><button id="act-key-save" class="copy-btn" type="button" hidden><span>保存</span></button><button id="act-key-cancel" class="copy-btn" type="button" hidden><span>取消</span></button></span>
+        <span class="grow"></span>
+        <span class="svc-actions">
+          <button id="act-lan" class="mini" type="button" aria-pressed="false" title="开启后转发口对同一局域网开放（其它设备凭密钥接入）；端口、密钥不变。关掉立即恢复只听本机">路由器广播</button>
+          <button id="act-lan-info" class="mini" type="button" hidden title="查看局域网接入地址、密钥与教程">局域网配置</button>
+        </span>
+        <span class="fact fact-mode" id="mode-group" title="两种上游方案随时可切：内嵌养一只隔离的 OpenCode；伪装直连 zen 免费池、逐字节模仿 OpenCode 客户端（内嵌被卡死时的保底）。切换不动端口、密钥和已写入的工具配置">
+          <span>方案</span>
+          <span class="segmented seg-mode">
+            <button id="mode-embedded" type="button" aria-pressed="true">内嵌</button>
+            <button id="mode-masquerade" type="button" aria-pressed="false">伪装</button>
+          </span>
+        </span>
+        <span class="svc-actions">
+          <button id="act-restart" class="mini" type="button" title="重启转发口和上游（控制面板不关）">重启服务</button>
+          <button id="act-stop" class="mini" type="button" title="停止转发口和上游，并摘除写入各工具的配置">关闭服务</button>
+        </span>
+      </div>
+    </footer>
+  </div>
+
+    <dialog id="lan-dialog" class="modal">
+      <div class="modal-card">
+        <h2>局域网接入</h2>
+        <p class="modal-lead">同一 Wi-Fi / 路由器下的设备（手机、另一台电脑）可以用下面的信息接入 OC Faucet 的模型。端口与密钥不变，本机照常用 127.0.0.1。</p>
+        <div class="lan-row"><span>局域网地址</span><span id="lan-addresses" class="lan-addresses">（没有可用的局域网地址）</span></div>
+        <div class="lan-row"><span>密钥</span><code id="lan-key" class="lan-key">…</code><button id="lan-key-copy" class="copy-btn" type="button"><span>复制</span></button></div>
+        <details class="lan-howto" open>
+          <summary>接入教程（通用三件套：Base URL + 密钥 + 模型 ID）</summary>
+          <ol>
+            <li>在客户端（ChatBox、NextChat、Cherry Studio、任意 OpenAI 兼容应用等）的「自定义供应商 / Provider」里新增一个供应商；接口类型按客户端支持选 <b>OpenAI 兼容</b> 或 <b>Anthropic 兼容</b>。</li>
+            <li><b>Base URL</b> 填上面的局域网地址：OpenAI 兼容填 <code>http://地址:端口/v1</code>；Anthropic 兼容填不含 <code>/v1</code> 的根地址。</li>
+            <li><b>API Key</b> 填上面的密钥。</li>
+            <li><b>模型 ID</b> 从下面挑一个填进去（也可以在客户端里「拉取模型列表」自动获取）：<span id="lan-models" class="lan-models"></span></li>
+          </ol>
+          <p class="hint">安全提示：密钥等于这个口的钥匙，只发给同一张局域网里的人；关掉「路由器广播」立即恢复只听本机。浏览器网页依旧进不来（带 Origin 的请求一律 403）。</p>
+        </details>
+        <div class="modal-actions"><button id="lan-close" class="btn" type="button">关闭</button></div>
+      </div>
+    </dialog>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
