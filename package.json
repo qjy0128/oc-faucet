@@ -1,6 +1,6 @@
 {
   "name": "oc-faucet",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "OC Faucet — 把 OpenCode 免费模型接入十种 AI 编程工具：模型体检、协议翻译、信封约束、一键接入，内嵌与伪装双上游",

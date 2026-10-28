@@ -77,7 +77,7 @@ async function restart() {
   const args = [MAIN];
   if (mode === 'web') args.push('--web');
 
-  // 端口沿用旧实例的：ZCode 配置里记着那个端口，换了端口 ZCode 就连不上了。
+  // 端口沿用旧实例的：已写入的工具配置里记着那个端口，换了端口它们就连不上了。
   // 如果这次命令行自己指定了 OCF_PORT / OCF_WEB_PORT，以命令行为准。
   const env = { ...process.env };
   if (env.OCF_PORT === undefined && Number.isInteger(before?.port) && before.port > 0) {

@@ -95,28 +95,30 @@ test('会话注册表：LRU 逐出最久没用的，容量可配', () => {
 /* 伪装头                                                               */
 /* ------------------------------------------------------------------ */
 
-test('impersonationHeaders：全套门禁头都在，affinity 头一个都没有', () => {
+test('impersonationHeaders：v2 门禁头齐全，会话头一致且不带旧回合头', () => {
   const session = openCodeNewID('ses', { descending: true });
   const headers = impersonationHeaders(session);
   assert.equal(headers['user-agent'], OPENCODE_USER_AGENT);
   assert.equal(headers['x-opencode-session'], session);
   assert.equal(headers['x-opencode-session-id'], session);
-  assert.match(headers['x-opencode-request'], /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  assert.equal(headers['x-session-affinity'], session);
+  assert.equal(headers['x-session-id'], session);
   assert.equal(headers['x-opencode-client'], 'cli');
   assert.equal(headers['x-opencode-project'], 'global');
-  // 带了这两个会被免费池 403——必须一个都不出现（任何大小写写法）
-  for (const key of Object.keys(headers)) {
-    assert.ok(!/session-affinity/i.test(key), `不许出现 ${key}`);
-    assert.ok(!/^x-session-id$/i.test(key), `不许出现 ${key}`);
-  }
+  assert.equal(headers['x-opencode-request'], undefined);
 });
 
-test('impersonationHeaders：每次调用都换新的 x-opencode-request', () => {
+test('OpenCode 客户端标识使用实测的 v2.2.0 形状', () => {
+  assert.equal(OPENCODE_USER_AGENT, 'opencode/latest/2.2.0/cli');
+});
+
+test('impersonationHeaders：Anthropic 旧接口保留 v1 回合头且不带 v2 会话头', () => {
   const session = openCodeNewID('ses', { descending: true });
-  const a = impersonationHeaders(session);
-  const b = impersonationHeaders(session);
-  assert.equal(a['x-opencode-session'], b['x-opencode-session'], '会话 id 不变');
-  assert.notEqual(a['x-opencode-request'], b['x-opencode-request'], '回合 id 必须次次新');
+  const headers = impersonationHeaders(session, { legacy: true });
+  assert.match(headers['user-agent'], /^opencode\/1\.19\.0 /);
+  assert.match(headers['x-opencode-request'], /^msg_/);
+  assert.equal(headers['x-session-affinity'], undefined);
+  assert.equal(headers['x-session-id'], undefined);
 });
 
 /* ------------------------------------------------------------------ */

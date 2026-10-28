@@ -10,10 +10,10 @@
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| macOS（Apple Silicon） | `OC.Faucet-1.0.0-arm64.dmg` | 打开拖进「应用程序」 |
-| Windows（64 位） | `OC.Faucet-Setup-1.0.0.exe` | 双击安装 |
+| macOS（Apple Silicon） | `OC.Faucet-1.0.1-arm64.dmg` | 打开拖进「应用程序」 |
+| Windows（64 位） | `OC.Faucet-Setup-1.0.1.exe` | 双击安装 |
 
-也可以从源码跑（需要 Node.js ≥ 22 和本机装有 [OpenCode](https://opencode.ai)）：
+也可以从源码跑（需要 Node.js ≥ 22 和本机装有 [OpenCode](https://opencode.ai)）。内嵌模式支持 OpenCode 1.x 和 2.x，启动时会自动识别主版本并选择对应的启动参数与 API：
 
 ```bash
 npm install
@@ -40,6 +40,8 @@ npm start         # 或只跑后台服务
 - **伪装**：直连 OpenCode Zen 免费池，请求逐字节模仿 OpenCode 客户端，完全不依赖本地 OpenCode（内嵌路线被卡死时的保底）。
 
 两方案的体检结论分开记忆，来回切换不用重测。
+
+排障时可把环境变量 `OCF_ISOLATE` 设为 `0` 临时关闭内嵌隔离。此时会复用你本机 OpenCode 的配置和凭据，可能使用付费供应商并产生费用；仅限确认风险后临时排查，完成后删除该变量或改回 `1`。
 
 ## 局域网访问
 

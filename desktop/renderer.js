@@ -1058,10 +1058,10 @@ async function showLanConfig() {
   else dialog.setAttribute('open', '');
 }
 
-/** 重启服务：只重启转发口和 OpenCode，控制面板不关；ZCode 配置不动 */
+/** 重启服务：只重启转发口和 OpenCode，控制面板不关；各接入工具的配置不动 */
 async function restartService() {
   const yes = window.confirm(
-    '重启会把转发口和隔离的 OpenCode 先关掉再拉起来，正在进行的请求会中断。\n\nZCode 的配置不会被改动。继续吗？',
+    '重启会把转发口和隔离的 OpenCode 先关掉再拉起来，正在进行的请求会中断。\n\n各接入工具里已写入的配置不会被改动。继续吗？',
   );
   if (!yes) return;
   note('正在重启服务…');
@@ -1075,7 +1075,7 @@ async function restartService() {
   note(next.port ? `服务已重启，转发口 127.0.0.1:${next.port}` : '服务已重启', 'ok');
 }
 
-/** 关闭服务：停掉转发口和 OpenCode；关停前会把写入各接入目标（ZCode 等）的配置一并摘除 */
+/** 关闭服务：停掉转发口和 OpenCode；关停前会把写入各接入工具的配置一并摘除 */
 async function stopService() {
   // Web 版关的是整个进程（面板也一起没），桌面版只停服务、窗口还留着
   const where =
@@ -1083,7 +1083,7 @@ async function stopService() {
       ? '\n\n这个 Web 面板也会跟着退出，之后要回终端重新启动。'
       : '\n\n窗口会留着，随时可以点「重启服务」再拉起来。';
   const yes = window.confirm(
-    `关闭后转发口会停掉，写入各接入工具（ZCode 等）的 OC Faucet 配置会被一并摘除。${where}\n\n之后重新启动，在「一键接入」区按需再写入即可。继续吗？`,
+    `关闭后转发口会停掉，写入各接入工具的 OC Faucet 配置会被一并摘除。${where}\n\n之后重新启动，在「一键接入」区按需再写入即可。继续吗？`,
   );
   if (!yes) return;
   note('正在关闭服务…');

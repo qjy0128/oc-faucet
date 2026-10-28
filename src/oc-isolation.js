@@ -65,8 +65,8 @@ export const ENV_WHITELIST = Object.freeze([
 /** XDG 四个目录名（Windows 上 OpenCode 也认这几个环境变量） */
 export const XDG_DIRS = Object.freeze(['config', 'data', 'cache', 'state']);
 
-/** 运行时目录下还要有的两个：会话工作区、启动时的工作目录 */
-const EXTRA_DIRS = Object.freeze(['project']);
+/** 运行时目录下还要有：会话工作区、启动时的工作目录，以及 v2 的隔离 HOME */
+const EXTRA_DIRS = Object.freeze(['project', 'home']);
 
 /**
  * 隔离配置：这只 OpenCode 只负责"推理"，不负责"动手"。

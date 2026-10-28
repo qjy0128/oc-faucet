@@ -30,7 +30,7 @@ test('assertInstallArgs：逐模型校验 id——缺 id、空 id、非字符串
   assert.throws(() => assertInstallArgs([{ id: '' }], ARGS, 'X'), /模型/);
   assert.throws(() => assertInstallArgs([{ id: 42 }], ARGS, 'X'), /模型/);
   assert.throws(() => assertInstallArgs([null], ARGS, 'X'), /模型/);
-  assert.throws(() => assertInstallArgs([{ id: 'no-slash' }], ARGS, 'X'), /模型/, 'ZCode 侧 id 必须是 provider/model 两段');
+  assert.throws(() => assertInstallArgs([{ id: 'no-slash' }], ARGS, 'X'), /模型/, '统一 id 必须是 provider/model 两段');
   // 混在好模型里的坏条目也要整批拒掉
   assert.throws(() => assertInstallArgs([...GOOD, { id: 'bad' }], ARGS, 'X'), /模型/);
   // 合法清单（含空清单：拦不拦空清单是各目标自己的事）不拦

@@ -32,6 +32,10 @@ import http from 'node:http';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
+if (argv.includes('--version')) {
+  console.log('opencode v1.19.3');
+  process.exit(0);
+}
 const portIdx = argv.indexOf('--port');
 const requestedPort = portIdx >= 0 ? Number(argv[portIdx + 1]) : 0;
 const host = '127.0.0.1';
@@ -503,6 +507,21 @@ test('构造时不给 dataDir 直接抛错', () => {
     assertBridgeError(error, { status: 400, code: 'invalid_request' });
     return true;
   });
+});
+
+test('OCF_ISOLATE=0 能关闭隔离，显式 isolate 参数优先于环境变量', (t) => {
+  const saved = process.env.OCF_ISOLATE;
+  process.env.OCF_ISOLATE = '0';
+  t.after(() => {
+    if (saved === undefined) delete process.env.OCF_ISOLATE;
+    else process.env.OCF_ISOLATE = saved;
+  });
+
+  const { client } = makeClient();
+  assert.equal(client.isolate, false);
+  assert.equal(client.serverPassword, null);
+  const { client: isolated } = makeClient({ isolate: true });
+  assert.equal(isolated.isolate, true);
 });
 
 /* ------------------------------------------------------------------ */

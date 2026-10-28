@@ -74,12 +74,12 @@ function makeZenStub() {
       return;
     }
 
-    if (path === '/inference/v1/models') {
+    if (path === '/inference/openai/v1/models') {
       json(res, 200, { object: 'list', data: [{ id: 'live-free' }, { id: 'big-pickle' }, { id: 'paid-one' }] });
       return;
     }
 
-    if (path === '/inference/v1/chat/completions') {
+    if (path === '/inference/openai/v1/chat/completions') {
       stub.chatRounds += 1;
       const corrective = Array.isArray(body?.messages) && body.messages.some((m) => m.role === 'tool');
       switch (stub.scenario) {
@@ -160,7 +160,7 @@ function makeZenStub() {
       return;
     }
 
-    if (path === '/inference/v1/responses') {
+    if (path === '/inference/openai/v1/responses') {
       switch (stub.scenario) {
         case 'responses-ok':
           sse(res, [
@@ -206,7 +206,7 @@ function makeClient(stub) {
 const stub = await makeZenStub();
 test.after(() => stub.close());
 
-const chatPosts = () => stub.requests.filter((r) => r.path === '/inference/v1/chat/completions');
+const chatPosts = () => stub.requests.filter((r) => r.path === '/inference/openai/v1/chat/completions');
 
 /* ------------------------------------------------------------------ */
 /* 目录                                                                */
@@ -243,7 +243,7 @@ test('providers：models.dev 撤掉 opencode 条目时退 zen 实时清单，免
   assert.deepEqual(picked.map((m) => m.modelID).sort(), ['big-pickle', 'live-free'], '-free 后缀与白名单算免费，其余按收费剔除');
 
   // 退路也要带伪装头（zen 的门禁不分目录还是推理）
-  const listReq = stub.requests.find((r) => r.path === '/inference/v1/models');
+  const listReq = stub.requests.find((r) => r.path === '/inference/openai/v1/models');
   assert.equal(listReq.headers['user-agent'], OPENCODE_USER_AGENT);
   assert.match(listReq.headers['x-opencode-session'], /^ses_/);
   stub.scenario = 'chat-ok';
@@ -271,12 +271,12 @@ test('prompt：chat 方言的伪装头逐项到位，请求体带桩工具且永
   assert.equal(headers['user-agent'], OPENCODE_USER_AGENT);
   assert.match(headers['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
   assert.equal(headers['x-opencode-session-id'], headers['x-opencode-session']);
-  assert.match(headers['x-opencode-request'], /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  assert.equal(headers['x-opencode-request'], undefined);
   assert.equal(headers['x-opencode-client'], 'cli');
   assert.equal(headers['x-opencode-project'], 'global');
   assert.equal(headers.authorization, 'Bearer public');
-  assert.equal(headers['x-session-affinity'], undefined, '带了会被免费池 403');
-  assert.equal(headers['x-session-id'], undefined);
+  assert.equal(headers['x-session-affinity'], headers['x-opencode-session']);
+  assert.equal(headers['x-session-id'], headers['x-opencode-session']);
 
   assert.equal(req.body.stream, true, '上游永远流式');
   assert.deepEqual(req.body.stream_options, { include_usage: true });
@@ -291,7 +291,7 @@ test('prompt：chat 方言的伪装头逐项到位，请求体带桩工具且永
   assert.ok(req.body.tools[0].function.parameters.required.length > 0, '空 schema 会被 403');
 });
 
-test('prompt：每次请求都换新的 x-opencode-request（纠正轮也是）', async () => {
+test('prompt：纠正轮也复用同一组 v2 会话头，不带旧回合头', async () => {
   stub.scenario = 'chat-toolcall';
   const client = makeClient(stub);
   await client.start();
@@ -302,8 +302,11 @@ test('prompt：每次请求都换新的 x-opencode-request（纠正轮也是）'
 
   const posts = chatPosts().slice(-2);
   assert.equal(posts.length, 2);
-  assert.notEqual(posts[0].headers['x-opencode-request'], posts[1].headers['x-opencode-request'], '回合 id 必须次次新');
-  assert.equal(posts[0].headers['x-opencode-session'], posts[1].headers['x-opencode-session'], '会话 id 全程复用');
+  for (const key of ['x-opencode-session', 'x-opencode-session-id', 'x-session-affinity', 'x-session-id']) {
+    assert.equal(posts[0].headers[key], posts[1].headers[key], `${key} 必须全程复用`);
+  }
+  assert.equal(posts[0].headers['x-opencode-request'], undefined);
+  assert.equal(posts[1].headers['x-opencode-request'], undefined);
 });
 
 /* ------------------------------------------------------------------ */
@@ -434,7 +437,7 @@ test('prompt：responses 方言——扁平工具、output_text/function_call �
   assert.equal(result.text, '答案');
   assert.deepEqual(result.tokens, { input: 9, output: 2, cache: { read: 1, write: 0 }, reasoning: 4 });
 
-  const req = stub.requests.find((r) => r.path === '/inference/v1/responses');
+  const req = stub.requests.find((r) => r.path === '/inference/openai/v1/responses');
   assert.equal(req.headers.authorization, 'Bearer public');
   assert.equal(req.headers['x-api-key'], undefined);
   assert.equal(req.body.instructions, '系统词');
@@ -502,5 +505,5 @@ test('杂项：createSession 给真形状 ses_ id；deleteSession 无害；上�
   await client.stop();
   assert.equal(client.ready, false);
   assert.equal(client.isolate, false);
-  assert.equal(client.baseUrl, `http://127.0.0.1:${stub.port}/inference/v1`);
+  assert.equal(client.baseUrl, `http://127.0.0.1:${stub.port}/inference/openai/v1`);
 });

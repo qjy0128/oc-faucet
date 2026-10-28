@@ -81,7 +81,7 @@ function createWindow() {
   });
   win.loadFile(path.join(__dirname, 'index.html'));
   win.on('close', (event) => {
-    // 关窗口 ≠ 退出：继续在托盘里跑，否则 ZCode 里的模型会断。
+    // 关窗口 ≠ 退出：继续在托盘里跑，否则已接入工具里的模型会断。
     if (!quitting) {
       event.preventDefault();
       win.hide();
@@ -240,7 +240,7 @@ function registerIpc() {
   });
 
   ipcMain.handle('oc:restart', async () => {
-    // 只重启转发口和 OpenCode，窗口不动；ZCode 配置也不动
+    // 只重启转发口和 OpenCode，窗口不动；各接入工具的配置也不动
     const snapshot = await bridge.restart();
     pushState();
     return snapshot;

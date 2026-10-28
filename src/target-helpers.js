@@ -14,7 +14,7 @@ import { BridgeError } from './errors.js';
 
 /**
  * install 入口的校验。label 是目标显示名，只用于报错文案。
- * 除了 port / apiKey / models 三件套，还逐模型校验 id：ZCode 侧 id 约定是
+ * 除了 port / apiKey / models 三件套，还逐模型校验 id：统一 id 约定是
  * `${providerID}/${modelID}`（见 docs/接口约定.md §2），缺 id 或没有斜杠的条目
  * 写进任何目标都是垃圾数据，必须在写盘前整批拦下。
  * @param {unknown} models

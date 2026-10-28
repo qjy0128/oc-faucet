@@ -1,28 +1,22 @@
 /**
  * 伪装层（impersonation）：让本桥的直连请求在 zen 眼里就是一只真的 OpenCode 客户端。
  *
- * 这是 Magpie 路线的核心（参考 /tmp/magpie/internal/provider/opencode_client.go，
- * 其注释里的门禁规则全部来自 2026-10 真机实测）。免费池只伺候"看起来是 OpenCode"
- * 的请求，缺一样就 403/400/426：
- *
- *   1. UA 必须是真实客户端字串（版本 ≥1.18.0，否则 426）；
- *   2. `x-opencode-session`(+`-id`) 必须是 OpenCode 版式的 ses_ id——按它的
- *      identifier.ts 算法生成：`ses_` + 12 位十六进制（毫秒×0x1000+当日计数，
- *      会话 id 按位取反）+ 14 位随机 base62；同一会话每回合复用，两个会话绝不共用；
- *   3. `x-opencode-request` 每次请求都换新的 msg_ id（同格式，不取反）；
+ * v2.2.0 真机实测的门禁口径：
+ *   1. UA 是 `opencode/latest/<版本>/cli`；
+ *   2. `x-opencode-session`(+`-id`) 使用 OpenCode 版式的 ses_ id，同会话复用；
+ *   3. 不再发送 v1 的 `x-opencode-request`；
  *   4. `x-opencode-client: cli`、`x-opencode-project: global`；
- *   5. 绝不带 `x-session-affinity` / `X-Session-Id`（带了 403）；
- *   6. 工具表里必须有小写 bash、read 且带真实参数 schema（空 schema 403）；
- *   7. 上游永远流式（stream:true）；
- *   8. 匿名密钥 "public" 即可，不需要任何登录态——**绝不把用户凭据带过来**。
+ *   5. v2 会带 `x-session-affinity` / `x-session-id`，值都与会话 id 相同；
+ *   6. 工具表带真实参数 schema，上游永远流式（stream:true）；
+ *   7. 匿名密钥 "public" 即可，不需要任何登录态——**绝不把用户凭据带过来**。
  */
 import { randomBytes } from 'node:crypto';
 
-/** 我们冒充的 OpenCode 版本。zen 免费池拒收 1.18.0 以下（426）；被停用时只需改这一处。 */
-export const OPENCODE_VERSION = '1.19.0';
+/** 我们冒充的 OpenCode 版本。zen 停收这个主版本时只需改这一处。 */
+export const OPENCODE_VERSION = '2.2.0';
 
-/** OpenCode 1.19.0 实测发出的 User-Agent（ai-sdk 与 Bun 版本一并带上）。 */
-export const OPENCODE_USER_AGENT = `opencode/${OPENCODE_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`;
+/** OpenCode 2.2.0 实测发出的 User-Agent。 */
+export const OPENCODE_USER_AGENT = `opencode/latest/${OPENCODE_VERSION}/cli`;
 
 /** 没登录时 OpenCode 用的匿名密钥；zen 的免费模型认它。 */
 export const OPENCODE_ANONYMOUS_KEY = 'public';
@@ -143,21 +137,29 @@ export function createSessionRegistry({ keep = 1000 } = {}) {
 }
 
 /**
- * 拼一次上游调用的全套伪装头。每次调用都换新的 x-opencode-request（msg_ id）。
- * 注意：这里**绝不**设置 x-session-affinity / X-Session-Id——带了会被免费池 403。
+ * 拼一次上游调用的伪装头。OpenAI 方言走 v2；Anthropic 旧接口保留 v1 门禁。
  *
  * @param {string} sessionID 已定的会话 id（ses_ 开头）
+ * @param {{legacy?:boolean}} [o] legacy=true 时使用 v1 的 UA 与回合头
  * @returns {Record<string,string>}
  */
-export function impersonationHeaders(sessionID) {
-  return {
-    'user-agent': OPENCODE_USER_AGENT,
+export function impersonationHeaders(sessionID, { legacy = false } = {}) {
+  const headers = {
+    'user-agent': legacy
+      ? 'opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14'
+      : OPENCODE_USER_AGENT,
     'x-opencode-session': sessionID,
     'x-opencode-session-id': sessionID,
-    'x-opencode-request': openCodeNewID('msg'),
     'x-opencode-client': 'cli',
     'x-opencode-project': 'global',
   };
+  if (legacy) {
+    headers['x-opencode-request'] = openCodeNewID('msg');
+  } else {
+    headers['x-session-affinity'] = sessionID;
+    headers['x-session-id'] = sessionID;
+  }
+  return headers;
 }
 
 /**

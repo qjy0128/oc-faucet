@@ -70,7 +70,7 @@ export function isFreeModel(rawModel) {
 }
 
 /**
- * 合成 ZCode 侧 id。
+ * 合成各接入工具共用的统一 id。
  * @param {string} providerID
  * @param {string} modelID
  * @returns {string} `providerID/modelID`

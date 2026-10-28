@@ -6,13 +6,12 @@
  * 转交、体检、目标写入全部复用。两者的差别只在运输层：
  *
  *   - 没有子进程、没有会话状态、没有审批闸门；
- *   - 门禁靠伪装头 + 桩工具 + 永远流式过（规则见 zen-impersonate.js 顶部注释，
- *     全部来自 Magpie 的真机实测）；
+ *   - 门禁靠伪装头 + 桩工具 + 永远流式过（规则见 zen-impersonate.js 顶部注释）；
  *   - 模型若真调 bash/read 桩，调用会以**结构化 tool_call** 回到响应里
  *     （内嵌模式要走 SSE 事件流才拿得到），直接喂转交映射即可；
  *   - 绝不带任何用户凭据：永远匿名 public（隔离初衷不变）。
  *
- * 已知限制（v1，都写进了 docs/接口约定.md）：
+ * 当前限制：
  *   - 推理档位（variant）不透传——各方言的档位参数没有实测依据，宁可走默认；
  *   - Gemini 族的模型从伪装目录剔除（generateContent 方言不做）；
  *   - 每次调用自成一话（新 ses_ id），不做按对话的会话亲和（缓存命中让位于正确性）。
@@ -48,6 +47,7 @@ export class ZenClient {
     this.modelsDevUrl =
       typeof o.modelsDevUrl === 'string' && o.modelsDevUrl ? o.modelsDevUrl : process.env.OCF_MODELS_DEV_URL ?? MODELS_DEV_URL;
     this.inferenceRoot = `${base}/inference`;
+    this.openAiRoot = `${base}/inference/openai`;
     this.onLog = typeof o.onLog === 'function' ? o.onLog : () => {};
 
     this.#started = false;
@@ -72,7 +72,7 @@ export class ZenClient {
 
   /** 面板展示用：上游地址（伪装模式就是 zen 的推理口） */
   get baseUrl() {
-    return `${this.inferenceRoot}/v1`;
+    return `${this.openAiRoot}/v1`;
   }
 
   /** 没有进程可起；目录懒拉，第一次 providers() 才触网 */
@@ -180,7 +180,7 @@ export class ZenClient {
 
   /** zen 自己的 /models 实时清单（信息不全时的退路；免费判定退化为后缀+白名单） */
   async #modelsFromZen() {
-    const res = await this.#zenFetch(`${this.inferenceRoot}/v1/models`, { session: 'catalog' });
+    const res = await this.#zenFetch(`${this.openAiRoot}/v1/models`, { session: 'catalog' });
     if (!res.ok) {
       throw new BridgeError(
         `问 zen 要模型清单失败（HTTP ${res.status}）：${res.text.slice(0, 200)}`,
@@ -380,8 +380,8 @@ export class ZenClient {
       dialect === 'anthropic'
         ? `${this.inferenceRoot}/v1/messages`
         : dialect === 'responses'
-          ? `${this.inferenceRoot}/v1/responses`
-          : `${this.inferenceRoot}/v1/chat/completions`;
+          ? `${this.openAiRoot}/v1/responses`
+          : `${this.openAiRoot}/v1/chat/completions`;
 
     const res = await this.#zenFetch(url, { method: 'POST', body, session, dialect, timeoutMs, signal });
     if (!res.ok) throw this.#mapUpstreamError(res.status, res.text);
@@ -397,8 +397,7 @@ export class ZenClient {
   }
 
   /**
-   * 带全套伪装头的一次请求（收齐整个响应体；上游是流式的，但我们本就要收全再还）。
-   * 每次调用都换新的 x-opencode-request——这是门禁之一。
+   * 按方言带对应版本的伪装头（收齐整个响应体；上游是流式的，但我们本就要收全再还）。
    * session 可以是真 ses_ id（原样复用），也可以是任意 seed（注册表换真形状的）。
    */
   async #zenFetch(url, { method = 'GET', body, session, dialect = 'chat', timeoutMs = 30_000, signal } = {}) {
@@ -419,7 +418,7 @@ export class ZenClient {
         headers: {
           'content-type': 'application/json',
           accept: 'application/json, text/event-stream',
-          ...impersonationHeaders(sessionID),
+          ...impersonationHeaders(sessionID, { legacy: dialect === 'anthropic' }),
           // 匿名密钥按方言带（anthropic 多 x-api-key 和版本头）；
           // 这里绝不带任何用户凭据
           ...this.#authHeadersFor(dialect),

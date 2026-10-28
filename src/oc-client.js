@@ -14,18 +14,21 @@
  */
 import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
-import { accessSync, constants, mkdirSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import net from 'node:net';
 import { BridgeError } from './errors.js';
 import { handoffInput, rejectFeedback } from './handoff.js';
+import { permissionPayload, promptPayload, providersPayload } from './oc-v2.js';
 import {
   basicAuthHeader,
   buildIsolatedEnv,
   ensureRuntimeDirs,
+  isolatedConfig,
   randomPassword,
   runtimeRoot,
+  ISOLATED_AGENT,
 } from './oc-isolation.js';
 
 /** 等健康检查的总时长 */
@@ -36,6 +39,83 @@ const DEFAULT_PROMPT_TIMEOUT_MS = 180_000;
 const KILL_GRACE_MS = 3_000;
 /** 健康检查轮询间隔 */
 const POLL_INTERVAL_MS = 250;
+
+/** Windows 的 .cmd/.bat 不是可执行映像，必须经 shell；给路径加引号保住其中的空格。 */
+function spawnOpencode(found, args, options = {}) {
+  const shell = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(found);
+  return spawn(shell ? `"${found}"` : found, args, { ...options, shell });
+}
+
+/** Windows 没有 POSIX 信号语义，taskkill /T 才能把 cmd.exe 下面的 OpenCode 一起收掉。 */
+function killWindowsTree(child) {
+  return new Promise((resolve) => {
+    if (!child?.pid) {
+      try { child?.kill(); } catch {}
+      resolve();
+      return;
+    }
+    let killer;
+    let settled = false;
+    const timer = setTimeout(finish, KILL_GRACE_MS);
+    function finish() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    }
+    try {
+      killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      killer.once('error', finish);
+      killer.once('exit', finish);
+    } catch {
+      finish();
+    }
+  });
+}
+
+/** 在起服务前读主版本：v1/v2 的启动参数和 HTTP API 不能混用。 */
+function detectOpencodeMajor(found) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawnOpencode(found, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) {
+      reject(new BridgeError(`读取 OpenCode 版本失败：${error?.message ?? error}。`, 500, 'runtime_missing'));
+      return;
+    }
+    let output = '';
+    let settled = false;
+    const finish = (error, major) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(major);
+    };
+    const timer = setTimeout(() => {
+      if (process.platform === 'win32') void killWindowsTree(child);
+      else child.kill();
+      finish(new BridgeError(`读取 OpenCode 版本超时。请确认 ${found} 能正常执行。`, 500, 'runtime_missing'));
+    }, 5_000);
+    child.stdout?.on('data', (chunk) => { output = `${output}${chunk}`.slice(-4_000); });
+    child.stderr?.on('data', (chunk) => { output = `${output}${chunk}`.slice(-4_000); });
+    child.once('error', (error) => {
+      finish(new BridgeError(`读取 OpenCode 版本失败：${error.message}。请确认 ${found} 能正常执行。`, 500, 'runtime_missing'));
+    });
+    child.once('exit', (code) => {
+      const match = /\bv?(\d+)\.\d+(?:\.\d+)?/.exec(output);
+      if (code === 0 && match) {
+        finish(null, Number(match[1]));
+        return;
+      }
+      finish(new BridgeError(
+        `无法识别 OpenCode 版本（退出码 ${code}）：${output.trim() || '没有版本输出'}`,
+        500,
+        'runtime_missing',
+      ));
+    });
+  });
+}
 
 /** 日志行里抓实际端口用；两种写法都认 */
 const PORT_PATTERNS = [
@@ -56,10 +136,13 @@ const PORT_PATTERNS = [
 function discoverOpencode(explicit, pathEnv = process.env.PATH ?? '', home = homedir()) {
   const searched = [];
   const named = (value) => typeof value === 'string' && value.length > 0;
+  const windows = process.platform === 'win32';
 
   const tryFile = (candidate) => {
     if (!named(candidate)) return null;
     searched.push(candidate);
+    // Windows 的 X_OK 只看文件是否存在，无扩展名的 bash shim 必须在这里挡掉
+    if (windows && !/\.(?:exe|cmd|bat)$/i.test(candidate)) return null;
     try {
       accessSync(candidate, constants.X_OK);
       return candidate;
@@ -77,18 +160,31 @@ function discoverOpencode(explicit, pathEnv = process.env.PATH ?? '', home = hom
   if (envHit) return { found: envHit, searched };
 
   // 3) 家目录下的默认安装位置
-  const homeHit = tryFile(join(home, '.opencode', 'bin', 'opencode'));
+  const homeHit = tryFile(join(home, '.opencode', 'bin', windows ? 'opencode.exe' : 'opencode'));
   if (homeHit) return { found: homeHit, searched };
 
-  // 4) PATH
-  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
-  for (const dir of pathEnv.split(delimiter).filter(named)) {
-    for (const ext of exts) {
-      const hit = tryFile(join(dir, `opencode${ext}`));
+  const pathDirs = pathEnv.split(delimiter).filter(named);
+  if (windows) {
+    // npm 的外层 .cmd 只是启动器，真身在包内。所有目录先找 exe，再回退批处理。
+    const npmRoots = named(process.env.APPDATA) ? [join(process.env.APPDATA, 'npm'), ...pathDirs] : pathDirs;
+    for (const dir of npmRoots) {
+      const hit = tryFile(join(dir, 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe'));
       if (hit) return { found: hit, searched };
     }
+    for (const ext of ['.exe', '.cmd', '.bat']) {
+      for (const dir of pathDirs) {
+        const hit = tryFile(join(dir, `opencode${ext}`));
+        if (hit) return { found: hit, searched };
+      }
+    }
+    return { found: null, searched };
   }
 
+  // 4) POSIX PATH
+  for (const dir of pathDirs) {
+    const hit = tryFile(join(dir, 'opencode'));
+    if (hit) return { found: hit, searched };
+  }
   return { found: null, searched };
 }
 
@@ -241,8 +337,8 @@ export class OcClient {
     this.dataDir = o.dataDir;
     this.opencodePath = o.opencodePath;
     this.requestedPort = Number.isInteger(o.port) && o.port >= 0 ? o.port : 0;
-    // 隔离模式下 OpenCode 跑在自己的目录里；不隔离是给排障留的后路（OCF_ISOLATE=0）。
-    this.isolate = o.isolate !== false;
+    // 隔离模式下 OpenCode 跑在自己的目录里；OCF_ISOLATE=0 只给排障使用，显式参数优先。
+    this.isolate = typeof o.isolate === 'boolean' ? o.isolate : process.env.OCF_ISOLATE !== '0';
     this.runtimeRoot = runtimeRoot(o.dataDir);
     this.serverPassword = this.isolate ? randomPassword() : null;
     this.serverUsername = 'opencode';
@@ -254,6 +350,9 @@ export class OcClient {
     this.port = null;
     this.started = false;
     this.exited = false;
+    // 直接调用 HTTP 方法的旧测试/排障代码默认走 v1；start() 会按真实二进制覆盖
+    this.apiMajor = 1;
+    this._latestToolCalls = new Map();
 
     /** 正在进行的 start()，用来让并发调用共享同一次启动 */
     this._starting = null;
@@ -269,6 +368,7 @@ export class OcClient {
     this._eventDemand = 0;
     /** 事件流的 AbortController；null = 现在没有连接 */
     this._eventAbort = null;
+    this._eventReady = null;
   }
 
   /** start() 成功且未 stop */
@@ -296,12 +396,53 @@ export class OcClient {
    */
   _childEnv() {
     if (!this.isolate) return { ...process.env, ...this.env };
-    return buildIsolatedEnv({
+    const env = buildIsolatedEnv({
       root: this.runtimeRoot,
       baseEnv: process.env,
       password: this.serverPassword,
       username: this.serverUsername,
       extraEnv: this.env,
+    });
+    if (this.apiMajor >= 2) {
+      // v2 会直接读 HOME 下的技能/配置，XDG 白名单已经挡不住，必须连 HOME 一起隔离。
+      env.HOME = join(this.runtimeRoot, 'home');
+      env.USERPROFILE = env.HOME;
+      env.OPENCODE_CONFIG_DIR = dirname(this._v2ConfigFile());
+      delete env.OPENCODE_CONFIG_CONTENT;
+    }
+    return env;
+  }
+
+  _v2ConfigFile() {
+    return join(this.runtimeRoot, 'config', 'opencode', 'opencode.json');
+  }
+
+  _readV2Config() {
+    const file = this._v2ConfigFile();
+    if (!existsSync(file)) return {};
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (error) {
+      throw new BridgeError(`读取 OpenCode 隔离配置失败：${error?.message ?? error}`, 500, 'upstream_config_error');
+    }
+  }
+
+  _writeV2Config(config) {
+    const file = this._v2ConfigFile();
+    const tmp = `${file}.tmp`;
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, file);
+  }
+
+  _prepareV2Config() {
+    if (!this.isolate || this.apiMajor < 2) return;
+    const existing = this._readV2Config();
+    this._writeV2Config({
+      ...existing,
+      ...isolatedConfig,
+      agent: { ...(existing.agent ?? {}), ...isolatedConfig.agent },
     });
   }
 
@@ -333,24 +474,32 @@ export class OcClient {
    * 绝不能反过来把 prompt 搞挂。
    */
 
-  /** 需要事件流时计数 +1；返回释放函数（-1，归零断开） */
+  /** 需要事件流时计数 +1；返回释放函数（-1，归零断开），ready 等首次连接就绪 */
   _watchEvents() {
     this._eventDemand += 1;
     if (this._eventDemand === 1) this._startEventStream();
-    return () => {
+    const release = () => {
       this._eventDemand = Math.max(0, this._eventDemand - 1);
       if (this._eventDemand === 0) this._stopEventStream();
     };
+    release.ready = this._eventReady;
+    return release;
   }
 
   /** 维持一条 /event 长连接：断了 1 秒后重连，直到需求归零 */
   _startEventStream() {
     const controller = new AbortController();
     this._eventAbort = controller;
+    let opened;
+    this._eventReady = new Promise((resolve) => {
+      opened = resolve;
+      // 事件流只是 handoff 的保险丝，连不上不能反过来把 prompt 永久挂住
+      setTimeout(() => resolve(false), 2_000).unref?.();
+    });
     (async () => {
       while (!controller.signal.aborted) {
         try {
-          await this._streamEvents(controller.signal);
+          await this._streamEvents(controller.signal, () => opened(true));
         } catch (error) {
           if (!controller.signal.aborted) {
             this._log(`[OC Faucet] 事件流断开，稍后重连：${error?.message ?? error}`);
@@ -368,12 +517,14 @@ export class OcClient {
   _stopEventStream() {
     this._eventAbort?.abort();
     this._eventAbort = null;
+    this._eventReady = null;
   }
 
-  /** 一条 /event SSE 连接：只挑工具 part 缓存，别的事件一概忽略 */
-  _streamEvents(signal) {
+  /** 一条事件 SSE 连接：只挑工具调用缓存，别的事件一概忽略 */
+  _streamEvents(signal, onOpen = () => {}) {
     return new Promise((resolve, reject) => {
-      const url = new URL(`${this.baseUrl}/event`);
+      const path = this.apiMajor >= 2 ? '/api/event' : '/event';
+      const url = new URL(`${this.baseUrl}${path}`);
       const req = httpRequest(
         {
           hostname: url.hostname,
@@ -389,6 +540,7 @@ export class OcClient {
             reject(new BridgeError(`事件流 HTTP ${response.statusCode}`, 502, 'upstream_error'));
             return;
           }
+          onOpen();
           let buffer = '';
           response.on('data', (chunk) => {
             buffer += chunk.toString();
@@ -414,16 +566,41 @@ export class OcClient {
     });
   }
 
-  /** 事件形状兼容 {type,properties} 与 {payload:{type,properties}} 两种包装 */
+  /** 同时识别 v1 的 tool part 和 v2 的 session.tool.* 事件。 */
   _handleEvent(wrapper) {
     const event = wrapper?.payload ?? wrapper;
-    const part = event?.type === 'message.part.updated' ? event.properties?.part : undefined;
-    if (!part || typeof part !== 'object' || part.type !== 'tool' || !part.callID) return;
-    this._toolParts.set(part.callID, {
-      sessionID: event.properties?.sessionID,
-      tool: typeof part.tool === 'string' ? part.tool : null,
-      input: part.state?.input ?? {},
-    });
+    if (this.apiMajor >= 2) {
+      if (event?.type === 'session.tool.input.started' && event.id) {
+        this._toolParts.set(event.id, { sessionID: event.sessionID, tool: event.name ?? null, input: {} });
+        this._latestToolCalls.set(event.sessionID, event.id);
+      } else if (event?.type === 'session.tool.input.ended' && event.id) {
+        const previous = this._toolParts.get(event.id);
+        if (previous) {
+          try {
+            const input = JSON.parse(event.text);
+            if (input && typeof input === 'object' && !Array.isArray(input)) previous.input = input;
+          } catch {
+            // called 事件还会带结构化 input，这里解析不到不影响后续
+          }
+        }
+      } else if (event?.type === 'session.tool.called' && event.id) {
+        const previous = this._toolParts.get(event.id) ?? {};
+        this._toolParts.set(event.id, {
+          sessionID: event.sessionID,
+          tool: previous.tool ?? null,
+          input: event.input ?? previous.input ?? {},
+        });
+        this._latestToolCalls.set(event.sessionID, event.id);
+      }
+    } else {
+      const part = event?.type === 'message.part.updated' ? event.properties?.part : undefined;
+      if (!part || typeof part !== 'object' || part.type !== 'tool' || !part.callID) return;
+      this._toolParts.set(part.callID, {
+        sessionID: event.properties?.sessionID,
+        tool: typeof part.tool === 'string' ? part.tool : null,
+        input: part.state?.input ?? {},
+      });
+    }
     if (this._toolParts.size > 100) this._toolParts.delete(this._toolParts.keys().next().value);
   }
 
@@ -459,7 +636,7 @@ export class OcClient {
    */
   async _resolveOne(p, handoff, stats) {
     if (typeof handoff === 'function') {
-      const callID = p?.tool?.callID;
+      const callID = p?.tool?.callID ?? this._latestToolCalls.get(p.sessionID);
       const action = typeof callID === 'string' && callID ? await this._blockedAction(callID, p.sessionID) : null;
       let translated = null;
       if (action) {
@@ -493,6 +670,12 @@ export class OcClient {
 
   /** 拒掉一条审批（失败由调用方吞） */
   _replyPermission(p, message) {
+    if (this.apiMajor >= 2) {
+      return this._request(
+        `${this.baseUrl}/api/session/${encodeURIComponent(p.sessionID)}/permission/${encodeURIComponent(p.id)}/reply`,
+        { method: 'POST', body: { decision: 'reject', message }, timeoutMs: 5_000 },
+      );
+    }
     return this._request(`${this.baseUrl}/permission/${encodeURIComponent(p.id)}/reply`, {
       method: 'POST',
       body: { reply: 'reject', message },
@@ -522,8 +705,11 @@ export class OcClient {
     const sweep = async ({ final = false } = {}) => {
       let pending;
       try {
-        const res = await this._request(`${this.baseUrl}/permission`, { timeoutMs: 5_000 });
-        pending = Array.isArray(res.json) ? res.json : [];
+        const path = this.apiMajor >= 2 ? '/api/permission/request' : '/permission';
+        const res = await this._request(`${this.baseUrl}${path}`, { timeoutMs: 5_000 });
+        pending = this.apiMajor >= 2
+          ? (Array.isArray(res.json?.data) ? res.json.data.map(permissionPayload) : [])
+          : (Array.isArray(res.json) ? res.json : []);
       } catch {
         return; // 问不出来就等下一轮；收尾轮询问不出来就算了
       }
@@ -556,7 +742,10 @@ export class OcClient {
 
   /** 让在途回合立刻收尾（转交命中后不再等模型把话说完）；失败由调用方吞 */
   _abortSession(sessionID) {
-    return this._request(`${this.baseUrl}/session/${encodeURIComponent(sessionID)}/abort`, {
+    const path = this.apiMajor >= 2
+      ? `/api/session/${encodeURIComponent(sessionID)}/interrupt`
+      : `/session/${encodeURIComponent(sessionID)}/abort`;
+    return this._request(`${this.baseUrl}${path}`, {
       method: 'POST',
       timeoutMs: 5_000,
     });
@@ -565,13 +754,16 @@ export class OcClient {
   /** 转交回合的 token 尽力而为：取会话里最后一条助手消息的统计，拿不到就 null */
   async _lastAssistantTokens(sessionID) {
     try {
+      const prefix = this.apiMajor >= 2 ? '/api/session' : '/session';
       const res = await this._request(
-        `${this.baseUrl}/session/${encodeURIComponent(sessionID)}/message?limit=1`,
+        `${this.baseUrl}${prefix}/${encodeURIComponent(sessionID)}/message?limit=1`,
         { timeoutMs: 5_000 },
       );
-      if (!res.ok || !Array.isArray(res.json)) return null;
-      for (let i = res.json.length - 1; i >= 0; i -= 1) {
-        const info = res.json[i]?.info;
+      const messages = this.apiMajor >= 2 ? res.json?.data : res.json;
+      if (!res.ok || !Array.isArray(messages)) return null;
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (this.apiMajor >= 2 && messages[i]?.type === 'assistant') return messages[i].tokens ?? null;
+        const info = messages[i]?.info;
         if (info && info.role === 'assistant') return info.tokens ?? null;
       }
       return null;
@@ -618,12 +810,15 @@ export class OcClient {
       );
     }
 
+    this.apiMajor = await detectOpencodeMajor(found);
+
     // 工作目录要先存在，否则 opencode 起来后会到处报奇怪错
     try {
       // 隔离模式下还要把 config/data/cache/state 一起建出来，
       // 否则 OpenCode 会回落到用户自己的 XDG 目录，隔离就白做了。
       if (this.isolate) ensureRuntimeDirs(this.runtimeRoot);
       mkdirSync(this.workdir, { recursive: true });
+      this._prepareV2Config();
     } catch (error) {
       throw new BridgeError(
         `建不出工作目录 ${this.workdir}：${error?.message ?? error}。请检查该路径有没有写入权限。`,
@@ -678,9 +873,9 @@ export class OcClient {
     let child;
     try {
       const args = ['serve', '--port', String(port), '--hostname', '127.0.0.1'];
-      // --pure 关掉插件加载，配合白名单环境变量，确保这只 OpenCode 干净
-      if (this.isolate) args.push('--pure');
-      child = spawn(found, args, {
+      // v1 用 --pure 关插件；v2 已移除这个参数，隔离 HOME 在 _childEnv 里处理
+      if (this.isolate && this.apiMajor < 2) args.push('--pure');
+      child = spawnOpencode(found, args, {
         cwd: this.workdir,
         env: this._childEnv(),
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -747,7 +942,8 @@ export class OcClient {
       }
 
       try {
-        const res = await this._request(`${this.baseUrl}/config/providers`, { timeoutMs: 3_000 });
+        const healthPath = this.apiMajor >= 2 ? '/api/provider' : '/config/providers';
+        const res = await this._request(`${this.baseUrl}${healthPath}`, { timeoutMs: 3_000 });
         if (res.ok) {
           this.started = true;
           this._log(`[OC Faucet] OpenCode 已就绪：${this.baseUrl}`);
@@ -785,12 +981,17 @@ export class OcClient {
     this.started = false;
   }
 
-  /** 收尸：SIGTERM → 等 3 秒 → SIGKILL，并等到进程真的退出 */
+  /** 收尸：Windows 清整棵树；POSIX 走 SIGTERM → 等 3 秒 → SIGKILL */
   async _killChild() {
     const child = this.child;
     this.child = null;
     if (!child || child.exitCode !== null || child.signalCode !== null) {
       // 进程早就没了（或者压根没起过）
+      this.exited = true;
+      return;
+    }
+    if (process.platform === 'win32') {
+      await killWindowsTree(child);
       this.exited = true;
       return;
     }
@@ -830,8 +1031,24 @@ export class OcClient {
     this.exited = true;
   }
 
-  /** GET /config/providers 的原始 JSON */
+  /** 模型清单统一返回 v1 形状；v2 的 provider/model 两个接口在这里合并。 */
   async providers() {
+    if (this.apiMajor >= 2) {
+      const responses = await Promise.all(
+        ['/api/provider', '/api/model', '/api/model/default'].map((path) =>
+          this._request(`${this.baseUrl}${path}`, { timeoutMs: 15_000 })),
+      );
+      const failed = responses.find((res) => !res.ok);
+      if (failed) {
+        throw new BridgeError(
+          `问 OpenCode 要模型清单失败（HTTP ${failed.status}）：${describeErrorBody(failed.json ?? failed.text)}`,
+          502,
+          'upstream_error',
+        );
+      }
+      return providersPayload(responses[0].json?.data, responses[1].json?.data, responses[2].json?.data);
+    }
+
     const res = await this._request(`${this.baseUrl}/config/providers`, { timeoutMs: 15_000 });
     if (!res.ok) {
       throw new BridgeError(
@@ -845,8 +1062,7 @@ export class OcClient {
 
   /**
    * 更新 OpenCode 隔离环境中的模型上下文限制。
-   * OpenCode 的全局配置会写入隔离 XDG 目录；随后等待全局实例释放，
-   * 下一次请求会用新限制重新读取模型，不需要重启 serve 进程。
+   * v1 走全局配置 API；v2 只写隔离配置文件并重载 location，都不需要重启 serve 进程。
    * @param {Array<{modelID:string,limit:{context:number,input?:number,output:number}}>} entries
    */
   async setModelContextWindows(entries) {
@@ -871,6 +1087,32 @@ export class OcClient {
       if (limit.input !== undefined) modelLimit.input = limit.input;
       modelLimit.output = limit.output;
       models[modelID] = { limit: modelLimit };
+    }
+
+    if (this.apiMajor >= 2) {
+      if (!this.isolate) {
+        throw new BridgeError('OpenCode v2 只允许在隔离模式下修改模型上下文，未改动任何配置。', 400, 'upstream_config_error');
+      }
+      const config = this._readV2Config();
+      const provider = { ...(config.provider ?? {}) };
+      const opencode = { ...(provider.opencode ?? {}) };
+      opencode.models = { ...(opencode.models ?? {}), ...models };
+      provider.opencode = opencode;
+      config.provider = provider;
+      this._writeV2Config(config);
+
+      const reloaded = await this._request(`${this.baseUrl}/api/location/reload`, {
+        method: 'POST',
+        timeoutMs: 15_000,
+      });
+      if (!reloaded.ok) {
+        throw new BridgeError(
+          `OpenCode 已保存模型上下文设置，但重新载入模型失败（HTTP ${reloaded.status}）：${describeErrorBody(reloaded.json ?? reloaded.text)}`,
+          502,
+          'upstream_dispose_error',
+        );
+      }
+      return { ok: true };
     }
 
     const patch = await this._request(`${this.baseUrl}/global/config`, {
@@ -900,9 +1142,10 @@ export class OcClient {
     return { ok: true };
   }
 
-  /** GET /agent 的原始 JSON 数组 */
+  /** agent 清单统一返回数组。 */
   async agents() {
-    const res = await this._request(`${this.baseUrl}/agent`, { timeoutMs: 15_000 });
+    const path = this.apiMajor >= 2 ? '/api/agent' : '/agent';
+    const res = await this._request(`${this.baseUrl}${path}`, { timeoutMs: 15_000 });
     if (!res.ok) {
       throw new BridgeError(
         `问 OpenCode 要 agent 清单失败（HTTP ${res.status}）：${describeErrorBody(res.json ?? res.text)}`,
@@ -910,7 +1153,9 @@ export class OcClient {
         'upstream_error',
       );
     }
-    return Array.isArray(res.json) ? res.json : [];
+    return this.apiMajor >= 2
+      ? (Array.isArray(res.json?.data) ? res.json.data : [])
+      : (Array.isArray(res.json) ? res.json : []);
   }
 
   /**
@@ -920,11 +1165,14 @@ export class OcClient {
   async createSession({ title, directory } = {}) {
     const body = {};
     if (title !== undefined) body.title = title;
-    // directory 是契约里的参数，但实测 opencode 1.19.3 不认它：
-    // 传 {"directory":"/tmp"} 照样返回 200，且会话目录仍是它自己启动时的工作目录。
-    // 所以这里只保留形参（保持签名与契约一致），不往请求里塞这个无效果的字段。
+    if (this.apiMajor >= 2) {
+      if (this.isolate) body.agent = ISOLATED_AGENT;
+      if (typeof directory === 'string' && directory) body.location = { directory };
+    }
+    // v1 的 directory 参数没有实际效果，继续不往旧接口里塞。
 
-    const res = await this._request(`${this.baseUrl}/session`, {
+    const path = this.apiMajor >= 2 ? '/api/session' : '/session';
+    const res = await this._request(`${this.baseUrl}${path}`, {
       method: 'POST',
       body,
       timeoutMs: 15_000,
@@ -937,7 +1185,7 @@ export class OcClient {
         'upstream_error',
       );
     }
-    const id = res.json?.id;
+    const id = this.apiMajor >= 2 ? res.json?.data?.id : res.json?.id;
     if (typeof id !== 'string' || !id) {
       throw new BridgeError(
         `OpenCode 建会话的返回里没有 id，看不懂它给的是什么：${res.text.slice(0, 200)}`,
@@ -950,8 +1198,9 @@ export class OcClient {
 
   /** 删除会话；失败不抛（只记日志） */
   async deleteSession(sessionID) {
+    const prefix = this.apiMajor >= 2 ? '/api/session' : '/session';
     const res = await this._request(
-      `${this.baseUrl}/session/${encodeURIComponent(sessionID)}`,
+      `${this.baseUrl}${prefix}/${encodeURIComponent(sessionID)}`,
       { method: 'DELETE', timeoutMs: 15_000 },
     ).catch((error) => {
       this._log(`[OC Faucet] 删会话 ${sessionID} 失败：${error?.message ?? error}`);
@@ -962,6 +1211,45 @@ export class OcClient {
         `[OC Faucet] 删会话 ${sessionID} 失败（HTTP ${res.status}）：${describeErrorBody(res.json ?? res.text)}`,
       );
     }
+  }
+
+  /** v2 的 prompt 只负责入队：先选模型，再等 idle，最后把 assistant 投影回旧响应形状。 */
+  async _promptV2(sessionID, body, { timeoutMs, signal }) {
+    const prefix = `${this.baseUrl}/api/session/${encodeURIComponent(sessionID)}`;
+    const deadline = Date.now() + timeoutMs;
+    const call = (path, { method = 'GET', payload } = {}) => this._request(path, {
+      method,
+      body: payload,
+      timeoutMs: Math.max(1, deadline - Date.now()),
+      signal,
+    });
+
+    const model = { providerID: body.model.providerID, id: body.model.modelID };
+    if (body.variant) model.variant = body.variant;
+    const selected = await call(`${prefix}/model`, { method: 'POST', payload: { model } });
+    if (!selected.ok) return selected;
+
+    const userText = body.parts
+      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('');
+    // v2 的系统词挂在 agent 配置上；每次请求不同的信封指令只能随本条输入一起下发。
+    const text = body.system ? `${body.system}\n\n${userText}` : userText;
+    const submitted = await call(`${prefix}/prompt`, { method: 'POST', payload: { text } });
+    if (!submitted.ok) return submitted;
+
+    const waited = await call(`${this.baseUrl}/api/experimental/session/${encodeURIComponent(sessionID)}/wait`, {
+      method: 'POST',
+    });
+    if (!waited.ok) return waited;
+
+    const messages = await call(`${prefix}/message?limit=1&type=assistant`);
+    if (!messages.ok) return messages;
+    const assistant = Array.isArray(messages.json?.data)
+      ? messages.json.data.find((message) => message?.type === 'assistant')
+      : null;
+    const json = promptPayload(assistant);
+    return { ok: true, status: 200, json, text: JSON.stringify(json) };
   }
 
   /**
@@ -1010,7 +1298,6 @@ export class OcClient {
     if (typeof variant === 'string' && variant) body.variant = variant;
     if (system !== undefined && system !== null && system !== '') body.system = system;
 
-    const route = `${this.baseUrl}/session/${encodeURIComponent(sessionID)}/message`;
     const wantHandoff = typeof handoff === 'function';
 
     // 转交需要事件流拿被拦动作的名字与参数；纯拒批路径不养长连接
@@ -1046,12 +1333,15 @@ export class OcClient {
     });
 
     try {
-      const messagePromise = this._request(route, {
-        method: 'POST',
-        body,
-        timeoutMs,
-        signal: fetchAbort.signal,
-      });
+      if (stopEvents?.ready) await stopEvents.ready;
+      const messagePromise = this.apiMajor >= 2
+        ? this._promptV2(sessionID, body, { timeoutMs, signal: fetchAbort.signal })
+        : this._request(`${this.baseUrl}/session/${encodeURIComponent(sessionID)}/message`, {
+          method: 'POST',
+          body,
+          timeoutMs,
+          signal: fetchAbort.signal,
+        });
 
       let res = null;
       if (wantHandoff) {
@@ -1087,7 +1377,7 @@ export class OcClient {
     }
   }
 
-  /** 把 POST /message 的响应翻成 {text, tokens}；所有失败按原有口径抛 BridgeError */
+  /** 把 v1/v2 的完成响应统一翻成 {text, tokens}；失败按原有口径抛 BridgeError */
   async _parsePromptResponse(res, sessionID) {
 
     // 上游报错时不一定有 info（实测模型不存在直接是 HTTP 500 + {name,data}），

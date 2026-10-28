@@ -33,7 +33,7 @@ function reasoningVariant(model, protocol, body) {
     throw new BridgeError(
       `模型「${model.id}」没有「${resolved.effort}」这个推理档位。` +
         `它支持的档位是：${supported || '（一个都没有，只能按默认跑）'}。` +
-        '请在 ZCode 里换一个档位，或者换一个支持该档位的模型。',
+        '请在当前客户端里换一个档位，或者换一个支持该档位的模型。',
       400,
       'unsupported_reasoning_effort',
     );
@@ -904,7 +904,7 @@ function findModel(models, id) {
     const tail = list.length > sample.length ? `（共 ${list.length} 个）` : '';
     throw new BridgeError(
       `模型「${id}」不在本机可用的模型列表里，用不了。可用的模型有：${sample.join('、') || '（当前一个都没有）'}${tail}。` +
-        `请在 ZCode 里重新选一个模型。`,
+        `请在当前客户端里重新选一个模型。`,
       400,
       'model_not_found'
     );
@@ -1178,7 +1178,7 @@ function maxTokensOf(value) {
 /**
  * 上行的 decoded 由 decodeEnvelope 校验过，这里是最后一道兜底。
  * 注意：兜底也绝不「编造」——工具名或参数不对时宁可抛错，
- * 因为替模型编一个工具名或补一个空参数，会让 ZCode 拿着错误的信息去执行动作。
+ * 因为替模型编一个工具名或补一个空参数，会让客户端拿着错误的信息去执行动作。
  */
 function normalizeDecoded(decoded) {
   if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {

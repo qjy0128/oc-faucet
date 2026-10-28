@@ -47,6 +47,10 @@ import http from 'node:http';
 import { writeFileSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
+if (argv.includes('--version')) {
+  console.log('opencode v1.19.3');
+  process.exit(0);
+}
 const i = argv.indexOf('--port');
 const port = i >= 0 ? Number(argv[i + 1]) : 0;
 // 先把自己的 PID 写下来：父进程退出后测试靠它判断有没有漏掉后台进程

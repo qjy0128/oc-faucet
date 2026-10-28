@@ -4,7 +4,7 @@
  * 它把四块拼起来：
  *   OcClient（跟隔离的 OpenCode 说话）
  *   probe   （体检哪些模型真能按协议干活）
- *   server  （本机转发口，ZCode 从这里进来）
+ *   server  （本机转发口，各接入工具从这里进来）
  *   信封     （把只会聊天的模型翻译成会说 Anthropic 协议的模型）
  *
  * 并对外暴露一个 Bridge 门面给桌面界面用。
@@ -151,7 +151,7 @@ export class Bridge {
     };
   }
 
-  /** 只把「能用」的模型给 ZCode，并把「只能聊天」的模型工具关掉 */
+  /** 只把「能用」的模型给接入工具，并把「只能聊天」的模型工具关掉 */
   getModels() {
     return [...this.state.verdicts.entries()]
       .filter(([, v]) => usable(v))
@@ -227,7 +227,7 @@ export class Bridge {
         if (available) {
           this.log(`  可用模型 ${available} 个${restored ? `（其中 ${restored} 个来自上次体检）` : ''}。`);
         } else {
-          this.log('  还没有可用的模型——ZCode 现在提问会提示模型不存在。');
+          this.log('  还没有可用的模型——接入工具现在提问会提示模型不存在。');
           this.log('  先体检一次：npm start -- --probe 12 --import');
         }
       } catch (error) {
@@ -525,8 +525,8 @@ export class Bridge {
   /**
    * 拉一遍模型目录，再用磁盘上的体检结论回填。**不发任何请求**。
    *
-   * 为什么启动时必须做：转发口是 ZCode 的入口，它只认「有判定、且判定可用」的模型
-   * （见 getModels）。少了这一步，端口虽然开着，却一个模型都不认——ZCode 那边每次
+   * 为什么启动时必须做：转发口是各接入工具的入口，它只认「有判定、且判定可用」的模型
+   * （见 getModels）。少了这一步，端口虽然开着，却一个模型都不认——接入工具每次
    * 提问都会收到「模型不存在」，而界面上还显示一切正常。
    *
    * 体检很贵（真的发消息、等模型回话），所以这里只读缓存，不替用户花额度。
@@ -1430,9 +1430,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     } else {
       const available = bridge.getModels().length;
       if (available) {
-        console.log('\n转发口已开着，ZCode 随时可以用。按 Ctrl+C 退出。');
+        console.log('\n转发口已开着，各接入工具随时可以用。按 Ctrl+C 退出。');
       } else {
-        console.log('\n转发口开着，但手头没有可用的模型，ZCode 现在提问会提示模型不存在。');
+        console.log('\n转发口开着，但手头没有可用的模型，接入工具现在提问会提示模型不存在。');
         console.log('先体检一次（会消耗少量免费额度）：npm start -- --probe 12 --import');
       }
       console.log('（想顺带体检并写入 ZCode：npm start -- --probe 12 --import）');
