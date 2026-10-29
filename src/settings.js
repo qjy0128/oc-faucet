@@ -97,7 +97,7 @@ const DEFAULTS = {
   probeConcurrency: 3,
   probeTtlMinutes: 360,
   theme: 'system',
-  // 上游方案：embedded = 内嵌隔离 OpenCode（默认）；masquerade = 逐字节伪装直连 zen
+  // 上游方案：embedded = 内嵌隔离 OpenCode（默认）；masquerade = Bun 侧车直连 zen
   upstreamMode: 'embedded',
   // 路由器广播：转发口是否对局域网开放（默认只绑 127.0.0.1）
   lanAccess: false,

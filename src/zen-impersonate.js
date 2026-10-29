@@ -1,5 +1,5 @@
 /**
- * 伪装层（impersonation）：让本桥的直连请求在 zen 眼里就是一只真的 OpenCode 客户端。
+ * 伪装层（impersonation）：让 Bun 侧车发出的请求在 zen 眼里就是一只真的 OpenCode 客户端。
  *
  * v2.2.0 真机实测的门禁口径：
  *   1. UA 是 `opencode/latest/<版本>/cli`；
@@ -36,8 +36,13 @@ export const MODELS_DEV_URL = 'https://models.dev/api.json';
  * nemotron-3.5-super-vl）读到"禁止调用"就真的不调，信封又没写好，体检被误判成
  * "只能聊天"。中性描述下：想动手的模型自然去调（转交接住），守协议的走信封，两条都通。
  */
+export const OPENCODE_CORE_TOOLS = Object.freeze(['bash', 'edit', 'glob', 'grep', 'read']);
+
 export const OPENCODE_TOOL_DESCRIPTIONS = Object.freeze({
   bash: 'Execute a bash command in the terminal.',
+  edit: 'Not available in this session. Never call this tool.',
+  glob: 'Not available in this session. Never call this tool.',
+  grep: 'Not available in this session. Never call this tool.',
   read: 'Read the contents of a file.',
 });
 
@@ -51,10 +56,37 @@ export const OPENCODE_TOOL_SCHEMAS = Object.freeze({
     },
     required: ['command'],
   }),
+  edit: Object.freeze({
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'The file to edit' },
+      oldString: { type: 'string', description: 'The text to replace' },
+      newString: { type: 'string', description: 'The replacement text' },
+      replaceAll: { type: 'boolean', description: 'Replace every occurrence' },
+    },
+    required: ['filePath', 'oldString', 'newString'],
+  }),
+  glob: Object.freeze({
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: 'The glob pattern' },
+      path: { type: 'string', description: 'The directory to search in' },
+    },
+    required: ['pattern'],
+  }),
+  grep: Object.freeze({
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: 'The regular expression to search for' },
+      path: { type: 'string', description: 'The directory to search in' },
+      include: { type: 'string', description: 'The file pattern to include' },
+    },
+    required: ['pattern'],
+  }),
   read: Object.freeze({
     type: 'object',
     properties: {
-      filePath: { type: 'string', description: 'The absolute path to the file or directory to read' },
+      filePath: { type: 'string', description: 'The absolute path of the file or directory to read' },
       offset: { type: 'integer', description: 'Line number to start reading from (1-indexed)' },
       limit: { type: 'integer', description: 'The maximum number of lines to read' },
     },
@@ -177,9 +209,9 @@ export function authHeaders(dialect) {
   return headers;
 }
 
-/** 两种方言各自的请求体里，桩工具（bash/read）长什么样。 */
+/** 各协议里 OpenCode 免费层要求的五个核心工具；只有 bash/read 参与转交。 */
 export function stubTools(dialect) {
-  return ['bash', 'read'].map((name) => {
+  return OPENCODE_CORE_TOOLS.map((name) => {
     const parameters = OPENCODE_TOOL_SCHEMAS[name];
     const description = OPENCODE_TOOL_DESCRIPTIONS[name];
     if (dialect === 'anthropic') {

@@ -77,7 +77,7 @@ export class Bridge {
     // 接入目标注册表：构造时建好，界面与动作面向它编程，不认具体目标。
     // targets 参数是留给测试的缝（塞假目标），正常情况用默认注册表。
     this.targets = targets ?? createTargets();
-    // 上游客户端工厂：默认按方案造真的（内嵌 OpenCode / 伪装直连 zen）；
+    // 上游客户端工厂：默认按方案造真的（内嵌 OpenCode / Bun 侧车直连 zen）；
     // makeClient 参数是留给测试的另一条缝（塞假客户端，不触网不起进程）
     this.#clientFactory = makeClient ?? ((mode) => this.#makeClient(mode));
     // 失败自动重试的节奏（默认 10 分钟，与失败判定的短 TTL 对齐；测试可调小）
@@ -86,7 +86,7 @@ export class Bridge {
     this.state = {
       phase: 'idle', // idle | starting | ready | probing | error
       error: null,
-      // 上游方案：embedded = 内嵌隔离 OpenCode；masquerade = 逐字节伪装直连 zen
+      // 上游方案：embedded = 内嵌隔离 OpenCode；masquerade = Bun 侧车逐字节伪装并直连 zen
       mode: 'embedded',
       models: [], // 全部模型（含未通过的）
       verdicts: new Map(), // modelId -> {verdict, note, checkedAt, elapsedMs, cached}
@@ -165,7 +165,7 @@ export class Bridge {
   #clientFactory;
   #autoRetryTimer = null;
 
-  /** 按当前方案造一个上游客户端（内嵌 OpenCode 或伪装直连 zen） */
+  /** 按当前方案造一个上游客户端（内嵌 OpenCode，或 Bun 侧车直连 zen） */
   #makeClient(mode) {
     if (mode === 'masquerade') {
       return new ZenClient({ onLog: (line) => this.log(line) });
@@ -253,7 +253,7 @@ export class Bridge {
   }
 
   /**
-   * 切换上游方案（内嵌 OpenCode ⇄ 伪装直连 zen）。
+   * 切换上游方案（内嵌 OpenCode ⇄ Bun 侧车直连 zen）。
    *
    * 端口、密钥、各接入目标里已写入的配置一概不动（模型 id 两方案同款）。
    * 服务在跑就热切换：**先把新方案起起来**，成了再停旧的——新方案起不来时
@@ -1122,7 +1122,7 @@ export class Bridge {
     if (!this.client?.ready) throw new BridgeError('OpenCode 还没起来，暂时不能保存模型上下文长度。', 503, 'not_ready');
     if (this.state.mode === 'masquerade') {
       throw new BridgeError(
-        '伪装模式直连 zen，没有可修改的模型上下文设置。切回内嵌方案后再改。',
+        '伪装模式由内置 Bun 侧车直连 zen，没有可修改的模型上下文设置。切回内嵌方案后再改。',
         409,
         'context_window_unsupported_mode',
       );

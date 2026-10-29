@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const renderer = readFileSync(new URL('../desktop/renderer.js', import.meta.url), 'utf8');
+const index = readFileSync(new URL('../desktop/index.html', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../desktop/style.css', import.meta.url), 'utf8');
 
 function declarations(selector, source = css) {
@@ -21,6 +22,14 @@ test('重启与关闭服务的通用确认文案不再单独指向 ZCode', () =>
   assert.doesNotMatch(serviceControls, /ZCode/i);
   assert.match(serviceControls, /各接入工具里已写入的配置不会被改动/);
   assert.match(serviceControls, /写入各接入工具的 OC Faucet 配置会被一并摘除/);
+});
+
+test('伪装模式的界面说明明确使用内置 Bun 侧车', () => {
+  assert.match(renderer, /正在切换到伪装方案（启动 Bun 侧车）/);
+  assert.match(renderer, /已切到伪装方案（内置 Bun 侧车直连 zen 免费池）/);
+  assert.match(index, /伪装由随应用打包的 Bun 侧车直连 zen/);
+  assert.match(index, /启动应用内置 Bun 侧车直连 zen/);
+  assert.doesNotMatch(index, /伪装直连 zen/);
 });
 
 test('状态栏允许整组换行，地址、密钥、方案和按钮不会被压成竖排', () => {

@@ -1,6 +1,6 @@
 {
   "name": "oc-faucet",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "description": "OC Faucet — 把 OpenCode 免费模型接入十种 AI 编程工具：模型体检、协议翻译、信封约束、一键接入，内嵌与伪装双上游",
@@ -17,9 +17,10 @@
     "test": "node --test test/*.test.js",
     "desktop": "node scripts/desktop.mjs",
     "verify": "node scripts/verify.mjs",
-    "dist": "electron-builder --mac --win",
-    "dist:mac": "electron-builder --mac",
-    "dist:win": "electron-builder --win"
+    "prepare:bun": "node scripts/prepare-bun.mjs",
+    "dist": "node scripts/prepare-bun.mjs darwin-arm64 win32-x64 && electron-builder --mac --win",
+    "dist:mac": "node scripts/prepare-bun.mjs darwin-arm64 && electron-builder --mac",
+    "dist:win": "node scripts/prepare-bun.mjs win32-x64 && electron-builder --win"
   },
   "keywords": [
     "opencode",
@@ -35,6 +36,10 @@
     "electron": "^44.0.0",
     "electron-builder": "^26.18.0"
   },
+  "optionalDependencies": {
+    "@oven/bun-darwin-aarch64": "1.4.4",
+    "@oven/bun-windows-x64": "1.4.4"
+  },
   "build": {
     "appId": "com.qjy0128.oc-faucet",
     "productName": "OC Faucet",
@@ -44,14 +49,21 @@
     },
     "files": [
       "desktop/**/*",
+      "!desktop/build/bun/**/*",
       "src/**/*",
       "web/**/*",
       "scripts/**/*",
-      "package.json"
+      "package.json",
+      "!node_modules/@oven/**/*"
     ],
     "mac": {
       "icon": "desktop/build/icon.icns",
       "category": "public.app-category.developer-tools",
+      "extraResources": [
+        { "from": "desktop/build/bun/darwin-arm64/bun", "to": "bun/bun" },
+        { "from": "src/zen-bun-sidecar.js", "to": "bun/zen-bun-sidecar.js" },
+        { "from": "legal/Bun-LICENSE.md", "to": "bun/LICENSE-Bun.md" }
+      ],
       "target": [
         {
           "target": "dmg",
@@ -63,6 +75,11 @@
     },
     "win": {
       "icon": "desktop/build/icon.ico",
+      "extraResources": [
+        { "from": "desktop/build/bun/win32-x64/bun.exe", "to": "bun/bun.exe" },
+        { "from": "src/zen-bun-sidecar.js", "to": "bun/zen-bun-sidecar.js" },
+        { "from": "legal/Bun-LICENSE.md", "to": "bun/LICENSE-Bun.md" }
+      ],
       "target": [
         {
           "target": "nsis",

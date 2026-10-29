@@ -138,11 +138,11 @@
           <button id="act-lan" class="mini" type="button" aria-pressed="false" title="开启后转发口对同一局域网开放（其它设备凭密钥接入）；端口、密钥不变。关掉立即恢复只听本机">路由器广播</button>
           <button id="act-lan-info" class="mini" type="button" hidden title="查看局域网接入地址、密钥与教程">局域网配置</button>
         </span>
-        <span class="fact fact-mode" id="mode-group" title="两种上游方案随时可切：内嵌养一只隔离的 OpenCode；伪装直连 zen 免费池、逐字节模仿 OpenCode 客户端（内嵌被卡死时的保底）。切换不动端口、密钥和已写入的工具配置">
+        <span class="fact fact-mode" id="mode-group" title="两种上游方案随时可切：内嵌养一只隔离的 OpenCode；伪装由随应用打包的 Bun 侧车直连 zen 免费池并模仿 OpenCode 客户端（内嵌被卡死时的保底）。切换不动端口、密钥和已写入的工具配置">
           <span>方案</span>
           <span class="segmented seg-mode">
-            <button id="mode-embedded" type="button" aria-pressed="true">内嵌</button>
-            <button id="mode-masquerade" type="button" aria-pressed="false">伪装</button>
+            <button id="mode-embedded" type="button" aria-pressed="true" title="启动隔离的 OpenCode（需要本机安装 OpenCode 1.x 或 2.x）">内嵌</button>
+            <button id="mode-masquerade" type="button" aria-pressed="false" title="启动应用内置 Bun 侧车直连 zen，不依赖本机 OpenCode">伪装</button>
           </span>
         </span>
         <span class="svc-actions">

@@ -994,12 +994,12 @@ async function switchUpstreamMode(mode) {
   if ((snapshot.mode === 'masquerade' ? 'masquerade' : 'embedded') === mode) return;
   switchingMode = true;
   renderMode();
-  note(mode === 'masquerade' ? '正在切换到伪装方案…' : '正在切换到内嵌方案…');
+  note(mode === 'masquerade' ? '正在切换到伪装方案（启动 Bun 侧车）…' : '正在切换到内嵌方案…');
   const result = await call('切换方案', () => window.oc.setUpstreamMode(mode));
   switchingMode = false;
   await refreshSnapshot();
   if (result) {
-    note(mode === 'masquerade' ? '已切到伪装方案（直连 zen 免费池）' : '已切到内嵌方案（隔离 OpenCode）', 'ok');
+    note(mode === 'masquerade' ? '已切到伪装方案（内置 Bun 侧车直连 zen 免费池）' : '已切到内嵌方案（隔离 OpenCode）', 'ok');
   }
 }
 

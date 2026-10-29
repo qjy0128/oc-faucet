@@ -136,18 +136,28 @@ test('authHeaders：chat/responses 只带 Bearer public；anthropic 再加 x-api
   assert.equal(OPENCODE_ANONYMOUS_KEY, 'public', '永远匿名，绝不带用户凭据');
 });
 
-test('stubTools：bash/read 逐字节带上 OpenCode 的参数 schema，描述诚实且中性', () => {
+test('stubTools：五个 OpenCode 核心工具都带完整 schema', () => {
   for (const dialect of ['chat', 'anthropic', 'responses']) {
     const tools = stubTools(dialect);
-    assert.deepEqual(tools.map((t) => (dialect === 'chat' ? t.function.name : t.name)).sort(), ['bash', 'read']);
+    assert.deepEqual(
+      tools.map((t) => (dialect === 'chat' ? t.function.name : t.name)).sort(),
+      ['bash', 'edit', 'glob', 'grep', 'read'],
+    );
     for (const tool of tools) {
       const fn = dialect === 'chat' ? tool.function : tool;
-      // 描述绝不能写"禁止调用"——那会让守规矩的模型不调桩，转交链路就断了
-      assert.ok(!/never|not available/i.test(fn.description), `描述不许劝退：${fn.description}`);
+      const name = fn.name;
+      if (name === 'bash' || name === 'read') {
+        assert.ok(!/never|not available/i.test(fn.description), '可转交工具的描述不许劝退');
+      } else {
+        assert.match(fn.description, /Not available/i, '占位工具必须明确不可调用');
+      }
       assert.ok(fn.description.length > 0, '描述不能为空');
       assert.ok(Array.isArray(fn.parameters?.required ?? fn.input_schema?.required), '必填项要在（空 schema 会被 403）');
       assert.ok(Object.keys((fn.parameters ?? fn.input_schema)?.properties ?? {}).length > 0, '参数 schema 不能是空的');
     }
   }
-  assert.deepEqual(stubTools('chat')[0].function.description, OPENCODE_TOOL_DESCRIPTIONS.bash);
+  assert.deepEqual(
+    stubTools('chat').find((tool) => tool.function.name === 'bash').function.description,
+    OPENCODE_TOOL_DESCRIPTIONS.bash,
+  );
 });

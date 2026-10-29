@@ -11,3 +11,4 @@ data/
 # ZCode 自己的会话目录，同 .dsh-computer-use 的待遇
 .zcode/
 dist/
+desktop/build/bun/

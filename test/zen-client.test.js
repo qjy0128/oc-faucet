@@ -114,6 +114,17 @@ function makeZenStub() {
             '[DONE]',
           ]);
           return;
+        case 'chat-503-once':
+          if (stub.chatRounds === 1) {
+            json(res, 503, { error: { message: 'Endpoint is unavailable' } });
+            return;
+          }
+          sse(res, [
+            { choices: [{ delta: { content: '重试成功' } }] },
+            { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } },
+            '[DONE]',
+          ]);
+          return;
         case 'http-403':
           json(res, 403, { error: { type: 'FreeTierError', message: 'OpenCode\'s free tier can only be used from within OpenCode' } });
           return;
@@ -199,6 +210,7 @@ function makeClient(stub) {
   return new ZenClient({
     baseUrl: `http://127.0.0.1:${stub.port}`,
     modelsDevUrl: `http://127.0.0.1:${stub.port}/modelsdev`,
+    fetch: (url, init) => fetch(url, init),
     onLog: () => {},
   });
 }
@@ -277,18 +289,41 @@ test('prompt：chat 方言的伪装头逐项到位，请求体带桩工具且永
   assert.equal(headers.authorization, 'Bearer public');
   assert.equal(headers['x-session-affinity'], headers['x-opencode-session']);
   assert.equal(headers['x-session-id'], headers['x-opencode-session']);
+  assert.equal(headers.accept, '*/*');
 
   assert.equal(req.body.stream, true, '上游永远流式');
   assert.deepEqual(req.body.stream_options, { include_usage: true });
   assert.equal(req.body.system, undefined);
-  assert.deepEqual(
-    req.body.messages,
-    [{ role: 'system', content: '你是测试' }, { role: 'user', content: '你好' }],
-  );
+  assert.equal(req.body.messages[0].role, 'system');
+  assert.match(req.body.messages[0].content, /^你是测试/);
+  assert.match(req.body.messages[0].content, /<env>[\s\S]*Working directory: unknown[\s\S]*<\/env>/);
+  assert.deepEqual(req.body.messages[1], { role: 'user', content: '你好' });
   const names = req.body.tools.map((t) => t.function.name).sort();
-  assert.deepEqual(names, ['bash', 'read']);
-  assert.equal(req.body.tools[0].function.description, OPENCODE_TOOL_DESCRIPTIONS.bash);
-  assert.ok(req.body.tools[0].function.parameters.required.length > 0, '空 schema 会被 403');
+  assert.deepEqual(names, ['bash', 'edit', 'glob', 'grep', 'read']);
+  for (const tool of req.body.tools) {
+    assert.ok(
+      Object.keys(tool.function.parameters?.properties ?? {}).length > 0,
+      `${tool.function.name} 的空 schema 会被 403`,
+    );
+  }
+  assert.equal(
+    req.body.tools.find((tool) => tool.function.name === 'bash').function.description,
+    OPENCODE_TOOL_DESCRIPTIONS.bash,
+  );
+});
+
+test('prompt：上游 5xx 短暂失败时重试，成功返回', async () => {
+  stub.scenario = 'chat-503-once';
+  stub.chatRounds = 0;
+  const client = makeClient(stub);
+  await client.start();
+  await client.providers();
+  const sessionID = await client.createSession();
+  const before = chatPosts().length;
+  const result = await client.prompt({ sessionID, modelID: 'demo-free', system: '', text: '你好', timeoutMs: 10_000 });
+  assert.equal(result.text, '重试成功');
+  assert.equal(chatPosts().length, before + 2);
+  stub.scenario = 'chat-ok';
 });
 
 test('prompt：纠正轮也复用同一组 v2 会话头，不带旧回合头', async () => {
@@ -319,6 +354,7 @@ test('prompt：模型真调 read 桩 → 结构化转交直接当答案', async 
   await client.start();
   await client.providers();
   const sessionID = await client.createSession();
+  const before = chatPosts().length;
 
   const blocked = [];
   const result = await client.prompt({
@@ -332,7 +368,7 @@ test('prompt：模型真调 read 桩 → 结构化转交直接当答案', async 
   assert.deepEqual(blocked, [{ native: 'read', input: { filePath: '/tmp/a.txt' } }], '桩调用以原生名+参数直达转交映射');
   assert.deepEqual(result.handoff, { name: 'Read', arguments: { file_path: '/tmp/a.txt' } });
   assert.equal(result.text, '');
-  assert.equal(chatPosts().length - stub.chatRounds, 0, '不该有多余轮次');
+  assert.equal(chatPosts().length, before + 1, '不该有多余轮次');
 });
 
 test('prompt：翻不了时纠正一轮——认领桩调用、回「工具不可用」，模型退回文字', async () => {
@@ -406,7 +442,7 @@ test('prompt：anthropic 方言——x-api-key+版本头、input_schema 工具�
   assert.equal(req.headers['x-api-key'], 'public');
   assert.equal(req.headers['anthropic-version'], '2023-06-01');
   assert.equal(req.headers.authorization, 'Bearer public');
-  assert.equal(req.body.system, '系统词');
+  assert.match(req.body.system, /^系统词[\s\S]*<env>[\s\S]*Working directory: unknown/);
   assert.equal(req.body.messages[0].role, 'user');
   assert.equal(req.body.tools[0].name, 'bash');
   assert.ok(req.body.tools[0].input_schema.required.length > 0);
@@ -440,7 +476,7 @@ test('prompt：responses 方言——扁平工具、output_text/function_call �
   const req = stub.requests.find((r) => r.path === '/inference/openai/v1/responses');
   assert.equal(req.headers.authorization, 'Bearer public');
   assert.equal(req.headers['x-api-key'], undefined);
-  assert.equal(req.body.instructions, '系统词');
+  assert.match(req.body.instructions, /^系统词[\s\S]*<env>[\s\S]*Working directory: unknown/);
   assert.equal(req.body.input, '你好');
   assert.equal(req.body.tools[0].type, 'function');
   assert.equal(req.body.tools[0].name, 'bash');

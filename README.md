@@ -10,8 +10,8 @@
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| macOS（Apple Silicon） | `OC.Faucet-1.0.1-arm64.dmg` | 打开拖进「应用程序」 |
-| Windows（64 位） | `OC.Faucet-Setup-1.0.1.exe` | 双击安装 |
+| macOS（Apple Silicon） | `OC.Faucet-1.0.2-arm64.dmg` | 打开拖进「应用程序」 |
+| Windows（64 位） | `OC.Faucet-Setup-1.0.2.exe` | 双击安装 |
 
 也可以从源码跑（需要 Node.js ≥ 22 和本机装有 [OpenCode](https://opencode.ai)）。内嵌模式支持 OpenCode 1.x 和 2.x，启动时会自动识别主版本并选择对应的启动参数与 API：
 
@@ -37,7 +37,7 @@ npm start         # 或只跑后台服务
 右下角「方案」随时可切，端口、密钥、已写入的配置都不动：
 
 - **内嵌**（默认）：在你电脑上养一只隔离的 OpenCode 做推理——独立目录、环境变量白名单、不带任何你自己的凭据；
-- **伪装**：直连 OpenCode Zen 免费池，请求逐字节模仿 OpenCode 客户端，完全不依赖本地 OpenCode（内嵌路线被卡死时的保底）。
+- **伪装**：随应用打包 Bun 侧车，由它直连 OpenCode Zen 免费池并模仿 OpenCode 客户端网络指纹，完全不依赖本地 OpenCode（内嵌路线被卡死时的保底）。
 
 两方案的体检结论分开记忆，来回切换不用重测。
 

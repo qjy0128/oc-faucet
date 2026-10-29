@@ -1,11 +1,12 @@
 /**
- * 伪装模式的上游客户端：直连 zen 免费池，请求逐字节模仿 OpenCode 客户端。
+ * 伪装模式的上游客户端：经内置 Bun 侧车直连 zen 免费池，请求逐字节模仿 OpenCode 客户端。
  *
  * 与 OcClient（内嵌模式）暴露同一套接口——providers / createSession / prompt /
  * deleteSession / ready / baseUrl / stop——Bridge 按设置择一使用，信封协议、
  * 转交、体检、目标写入全部复用。两者的差别只在运输层：
  *
- *   - 没有子进程、没有会话状态、没有审批闸门；
+ *   - 外网请求交给随包的 Bun 侧车：zen 会按 TLS/运行时指纹拒绝 Node，换请求头无效；
+ *   - 没有会话状态、没有审批闸门；
  *   - 门禁靠伪装头 + 桩工具 + 永远流式过（规则见 zen-impersonate.js 顶部注释）；
  *   - 模型若真调 bash/read 桩，调用会以**结构化 tool_call** 回到响应里
  *     （内嵌模式要走 SSE 事件流才拿得到），直接喂转交映射即可；
@@ -18,6 +19,7 @@
  */
 import { BridgeError } from './errors.js';
 import { rejectFeedback } from './handoff.js';
+import { BunTransport } from './zen-bun-transport.js';
 import {
   MODELS_DEV_URL,
   OPENCODE_ANONYMOUS_KEY,
@@ -31,6 +33,38 @@ import {
 const DEFAULT_PROMPT_TIMEOUT_MS = 180_000;
 /** 目录拉取的等待 */
 const CATALOG_TIMEOUT_MS = 30_000;
+
+const OPENCODE_ENVIRONMENT = '<env>\n  Working directory: unknown\n</env>';
+const HAS_ENVIRONMENT = /<env>[\s\S]*Working directory:[\s\S]*<\/env>/;
+const RETRIES = 7;
+const RETRY_DELAY = 250;
+const RETRY_DELAY_MAX = 1_000;
+const SESSION_TRIES = 2;
+
+function withEnvironment(text) {
+  const body = typeof text === 'string' ? text : '';
+  if (HAS_ENVIRONMENT.test(body)) return body;
+  return body ? `${body}\n\n${OPENCODE_ENVIRONMENT}` : OPENCODE_ENVIRONMENT;
+}
+
+function pause(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error('Aborted'));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('Aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 /**
  * @param {object} [o]
@@ -55,11 +89,21 @@ export class ZenClient {
     this.#dialects = new Map();
     /** seed → 真 ses_ id（目录等非会话调用各领一个；合法 ses_ 原样复用） */
     this.#sessions = createSessionRegistry();
+    this.#baseOrigin = new URL(base).origin;
+    this.#fetchImpl = typeof o.fetch === 'function' ? o.fetch : null;
+    this.#transport = o.transport ?? null;
+    this.#bunPath = o.bunPath;
+    this.#sidecarPath = o.sidecarPath;
   }
 
   #started;
   #dialects;
   #sessions;
+  #baseOrigin;
+  #fetchImpl;
+  #transport;
+  #bunPath;
+  #sidecarPath;
 
   /** 与 OcClient 同名属性对齐：伪装模式没有隔离子进程，这个值让上下文覆盖功能整体关闭 */
   get isolate() {
@@ -75,13 +119,24 @@ export class ZenClient {
     return `${this.openAiRoot}/v1`;
   }
 
-  /** 没有进程可起；目录懒拉，第一次 providers() 才触网 */
+  /** 起 Bun 侧车；测试可注入 fetch 直接走本地桩。 */
   async start() {
+    if (!this.#fetchImpl) {
+      this.#transport ??= new BunTransport({
+        baseOrigin: this.#baseOrigin,
+        bunPath: this.#bunPath,
+        sidecarPath: this.#sidecarPath,
+        log: (line) => this._log(line),
+      });
+      await this.#transport.start();
+      this.#fetchImpl = (url, init) => this.#transport.fetch(url, init);
+    }
     this.#started = true;
   }
 
   async stop() {
     this.#started = false;
+    await this.#transport?.stop();
   }
 
   _log(line) {
@@ -125,7 +180,7 @@ export class ZenClient {
       models[modelID] = raw;
     }
     if (skippedGemini) {
-      this._log(`[伪装] ${skippedGemini} 个 Gemini 族模型不支持伪装直连，已从目录剔除`);
+      this._log(`[伪装] ${skippedGemini} 个 Gemini 族模型不支持通过 Bun 侧车直连，已从目录剔除`);
     }
     if (!Object.keys(models).length) {
       throw new BridgeError(
@@ -134,7 +189,7 @@ export class ZenClient {
         'zen_catalog_empty',
       );
     }
-    return { providers: [{ id: 'opencode', name: 'OpenCode Zen（伪装直连）', models }] };
+    return { providers: [{ id: 'opencode', name: 'OpenCode Zen（Bun 侧车）', models }] };
   }
 
   /** models.dev 的 opencode 条目 → 原始模型数组（含方言标注） */
@@ -228,7 +283,7 @@ export class ZenClient {
   /** 伪装模式没有 OpenCode 全局配置可写；明确拒绝而不是假装成功 */
   async setModelContextWindows() {
     throw new BridgeError(
-      '伪装模式直连 zen，没有可以修改上下文长度的 OpenCode 配置。切回内嵌模式后再改。',
+      '伪装模式由内置 Bun 侧车直连 zen，没有可以修改上下文长度的 OpenCode 配置。切回内嵌模式后再改。',
       409,
       'context_window_unsupported_mode',
     );
@@ -269,7 +324,10 @@ export class ZenClient {
     const first = await this.#round(dialect, modelID, sessionID, messages, { timeoutMs, signal });
     const stubCalls = first.calls.filter((call) => call.name === 'bash' || call.name === 'read');
     if (!stubCalls.length) {
-      return { text: first.text, tokens: first.tokens, handoff: null, nativeBlocked: 0 };
+      const dropped = first.calls.length
+        ? '（模型调用了本会话没有提供的工具，该调用已忽略。）'
+        : '';
+      return { text: first.text || dropped, tokens: first.tokens, handoff: null, nativeBlocked: 0 };
     }
 
     // 模型真调了桩工具：先试转交（native 名和参数恰好就是映射表认的原生形状）
@@ -314,15 +372,17 @@ export class ZenClient {
   /** 按方言拼初始消息（信封 system + 一条 user 文本；历史已摊平在信封文本里） */
   #seedMessages(dialect, { system, text }) {
     if (dialect === 'anthropic') {
-      return { system: system ?? '', messages: [{ role: 'user', content: text }] };
+      return { system: withEnvironment(system), messages: [{ role: 'user', content: text }] };
     }
     if (dialect === 'responses') {
-      return { instructions: system ?? '', input: text };
+      return { instructions: withEnvironment(system), input: text };
     }
-    const messages = [];
-    if (system) messages.push({ role: 'system', content: system });
-    messages.push({ role: 'user', content: text });
-    return { messages };
+    return {
+      messages: [
+        { role: 'system', content: withEnvironment(system) },
+        { role: 'user', content: text },
+      ],
+    };
   }
 
   /** 纠正轮：把模型的桩调用认领下来，回一条点名工具、指回信封的反馈（与内嵌模式同款文案） */
@@ -383,7 +443,22 @@ export class ZenClient {
           ? `${this.openAiRoot}/v1/responses`
           : `${this.openAiRoot}/v1/chat/completions`;
 
-    const res = await this.#zenFetch(url, { method: 'POST', body, session, dialect, timeoutMs, signal });
+    let res;
+    let activeSession = session;
+    for (let attempt = 0; attempt <= RETRIES; attempt += 1) {
+      // 冷上游会短暂 503；连续失败后换一个新会话，避免一直命中同一个坏后端。
+      if (attempt >= SESSION_TRIES) activeSession = openCodeNewID('ses', { descending: true });
+      res = await this.#zenFetch(url, {
+        method: 'POST',
+        body,
+        session: activeSession,
+        dialect,
+        timeoutMs,
+        signal,
+      });
+      if (res.ok || res.status < 500 || attempt >= RETRIES) break;
+      await pause(Math.min(RETRY_DELAY * 2 ** attempt, RETRY_DELAY_MAX), signal);
+    }
     if (!res.ok) throw this.#mapUpstreamError(res.status, res.text);
     const gathered = this.#gather(dialect, res.text);
     if (!gathered.events) {
@@ -412,12 +487,12 @@ export class ZenClient {
       else signal.addEventListener('abort', relay, { once: true });
     }
     try {
-      const res = await fetch(url, {
+      const res = await this.#fetchImpl(url, {
         method,
         signal: controller.signal,
         headers: {
           'content-type': 'application/json',
-          accept: 'application/json, text/event-stream',
+          accept: '*/*',
           ...impersonationHeaders(sessionID, { legacy: dialect === 'anthropic' }),
           // 匿名密钥按方言带（anthropic 多 x-api-key 和版本头）；
           // 这里绝不带任何用户凭据
@@ -457,23 +532,27 @@ export class ZenClient {
     const detail = this.#errorDetail(text);
     if (status === 403) {
       return new BridgeError(
-        `zen 拒绝了这次免费请求${detail ? `（${detail}）` : ''}。模型可能刚被轮下线，或者请求形状被认出；可以稍后重试，或切回内嵌模式。`,
+        `zen 返回 HTTP 403，拒绝了这次免费请求${detail ? `（${detail}）` : ''}。模型可能刚被轮下线，或请求形状被认出；可以稍后重试，或切回内嵌模式。`,
         502,
         'zen_forbidden',
       );
     }
     if (status === 426) {
       return new BridgeError(
-        `zen 停收当前伪装的 OpenCode 版本${detail ? `（${detail}）` : ''}。需要更新 src/zen-impersonate.js 里的 OPENCODE_VERSION。`,
+        `zen 返回 HTTP 426，停收当前伪装的 OpenCode 版本${detail ? `（${detail}）` : ''}。需要更新 src/zen-impersonate.js 里的 OPENCODE_VERSION。`,
         502,
         'zen_version_rejected',
       );
     }
     if (status === 410) {
-      return new BridgeError(`这个模型已被 zen 弃用${detail ? `：${detail}` : ''}。请换一个模型（目录刷新后会反映）。`, 502, 'zen_model_deprecated');
+      return new BridgeError(`zen 返回 HTTP 410，这个模型已被弃用${detail ? `：${detail}` : ''}。请换一个模型（目录刷新后会反映）。`, 502, 'zen_model_deprecated');
     }
     if (status === 429) {
-      return new BridgeError(`zen 限流了${detail ? `（${detail}）` : ''}。稍等片刻再试。`, 429, 'zen_rate_limited');
+      return new BridgeError(
+        `zen 返回 HTTP 429：免费额度或当前网络/IP 被限流${detail ? `（${detail}）` : ''}。等额度重置、切换网络，或切回内嵌模式。`,
+        429,
+        'zen_rate_limited',
+      );
     }
     return new BridgeError(`模型这次没能给出回答（zen HTTP ${status}）${detail ? `：${detail}` : '，上游没有给出可读的说明'}`, 502, 'upstream_error');
   }
