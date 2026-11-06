@@ -13,7 +13,7 @@ import { PROBE_FINGERPRINT } from '../src/probe.js';
 import * as settings from '../src/settings.js';
 
 /** 假上游客户端：记录生命周期，目录里放一个本方案专属的免费模型 */
-function fakeClient(label) {
+function fakeClient(label, { onExit } = {}) {
   const events = [];
   return {
     label,
@@ -49,29 +49,52 @@ function fakeClient(label) {
       return { text: '{"content":"ok","calls":[]}', tokens: null, handoff: null };
     },
     async deleteSession() {},
+    exit(code = 1) {
+      this.ready = false;
+      onExit?.({ code, signal: null });
+    },
   };
 }
 
 /** 造一个带客户端工厂缝的 Bridge；目录与设置都进临时目录 */
-async function bridgeWithClients({ masqueradeStartError } = {}) {
+async function bridgeWithClients({ masqueradeStartError, afterClientStart, exitDuringProviders = false, masqueradeProviders } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'oc-bridge-modes-'));
   const previousDataDir = process.env.OCF_DATA_DIR;
   process.env.OCF_DATA_DIR = dir;
   await settings.ensureLayout();
   const created = [];
-  const bridge = new Bridge({
+  let bridge;
+  bridge = new Bridge({
     log: () => {},
     targets: [],
-    makeClient: (mode) => {
+    makeClient: (mode, options) => {
       if (mode === 'masquerade' && masqueradeStartError) {
-        const bad = fakeClient('masquerade');
+        const bad = fakeClient('masquerade', options);
         bad.start = async () => {
           throw masqueradeStartError;
         };
         created.push(bad);
         return bad;
       }
-      const client = fakeClient(mode);
+      const client = fakeClient(mode, options);
+      if (exitDuringProviders && mode === 'masquerade') {
+        const providers = client.providers.bind(client);
+        client.providers = async () => {
+          const result = await providers();
+          client.exit(8);
+          return result;
+        };
+      }
+      if (masqueradeProviders && mode === 'masquerade') {
+        client.providers = () => masqueradeProviders(client);
+      }
+      if (afterClientStart) {
+        const start = client.start.bind(client);
+        client.start = async () => {
+          await start();
+          await afterClientStart({ bridge, mode, client });
+        };
+      }
       created.push(client);
       return client;
     },
@@ -133,10 +156,33 @@ test('setUpstreamMode：有请求在跑时 409 忙拒，什么都没动', async 
 test('setUpstreamMode：服务没在跑时只落盘，状态跟着走', async (t) => {
   const ctx = await bridgeWithClients();
   t.after(ctx.restore);
+  ctx.bridge.state.phase = 'error';
+  ctx.bridge.state.error = '找不到 OpenCode';
+  ctx.bridge.state.errorCode = 'runtime_missing';
+  ctx.bridge.state.verdicts.set('opencode/embedded-free', { verdict: 'tool', note: '内嵌旧结论' });
   const result = await ctx.bridge.setUpstreamMode('masquerade');
-  assert.deepEqual(result, { ok: true, mode: 'masquerade', changed: true });
+  assert.deepEqual(result, { ok: true, mode: 'masquerade', changed: true, requiresStart: true });
   assert.equal((await settings.readSettings()).upstreamMode, 'masquerade');
   assert.equal(ctx.bridge.snapshot().mode, 'masquerade', '快照要带方案字段');
+  assert.equal(ctx.bridge.snapshot().phase, 'idle');
+  assert.equal(ctx.bridge.snapshot().error, null);
+  assert.equal(ctx.bridge.snapshot().errorCode, null);
+  assert.equal(ctx.bridge.state.verdicts.size, 0, '方案改了就不能沿用另一方案的内存判定');
+});
+
+test('setUpstreamMode：未运行时选择当前方案会保留旧启动错误', async (t) => {
+  const ctx = await bridgeWithClients();
+  t.after(ctx.restore);
+  ctx.bridge.state.phase = 'error';
+  ctx.bridge.state.error = '找不到 OpenCode';
+  ctx.bridge.state.errorCode = 'runtime_missing';
+
+  const result = await ctx.bridge.setUpstreamMode('embedded');
+
+  assert.deepEqual(result, { ok: true, mode: 'embedded', changed: false, requiresStart: true });
+  assert.equal(ctx.bridge.snapshot().phase, 'error');
+  assert.equal(ctx.bridge.snapshot().error, '找不到 OpenCode');
+  assert.equal(ctx.bridge.snapshot().errorCode, 'runtime_missing');
 });
 
 test('setUpstreamMode：热切换——新的先起、旧的再停、目录刷新、判定按方案恢复', async (t) => {
@@ -160,6 +206,107 @@ test('setUpstreamMode：热切换——新的先起、旧的再停、目录刷�
   await ctx.bridge.setUpstreamMode('embedded');
   assert.equal(ctx.bridge.client.label, 'embedded');
   assert.equal(ctx.bridge.getModels().length, 1, '切回内嵌后判定按本方案指纹恢复');
+});
+
+test('热切换：旧上游在新端启动期间退出，新端成功后恢复为就绪', async (t) => {
+  let exitOldDuringEmbeddedStart = false;
+  const ctx = await bridgeWithClients({
+    afterClientStart: async ({ bridge, mode }) => {
+      if (mode === 'embedded' && exitOldDuringEmbeddedStart) bridge.client.exit(7);
+    },
+  });
+  t.after(ctx.restore);
+  await bridgeWithClientsStart(ctx.bridge);
+  await ctx.bridge.setUpstreamMode('masquerade');
+  exitOldDuringEmbeddedStart = true;
+
+  const result = await ctx.bridge.setUpstreamMode('embedded');
+
+  assert.equal(result.requiresStart, false);
+  assert.equal(ctx.bridge.snapshot().phase, 'ready');
+  assert.equal(ctx.bridge.snapshot().error, null);
+  assert.equal(ctx.bridge.snapshot().errorCode, null);
+  assert.equal(ctx.bridge.snapshot().upstream.ready, true);
+});
+
+test('热切换：新上游在停止旧端期间退出时保留断开状态并报错', async (t) => {
+  const ctx = await runningEmbedded();
+  t.after(ctx.restore);
+  await ctx.bridge.setUpstreamMode('masquerade');
+  const previousClient = ctx.bridge.client;
+  let signalStopEntered;
+  const stopEntered = new Promise((resolve) => { signalStopEntered = resolve; });
+  let releaseStop;
+  const waitForStopRelease = new Promise((resolve) => { releaseStop = resolve; });
+  previousClient.stop = async () => {
+    signalStopEntered();
+    await waitForStopRelease;
+    previousClient.ready = false;
+  };
+
+  const switching = ctx.bridge.setUpstreamMode('embedded').then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  await stopEntered;
+  const nextClient = ctx.created.at(-1);
+  nextClient.exit(9);
+  releaseStop();
+  const outcome = await switching;
+
+  assert.equal(outcome.error?.code, 'upstream_disconnected');
+  assert.equal(ctx.bridge.client, nextClient);
+  assert.equal(nextClient.ready, false);
+  assert.equal(ctx.bridge.snapshot().phase, 'error');
+  assert.equal(ctx.bridge.snapshot().errorCode, 'upstream_disconnected');
+  assert.equal(ctx.bridge.snapshot().upstream.ready, false);
+});
+
+test('热切换模型恢复时 providers 导致新上游退出，切换必须报断开错误', async (t) => {
+  const ctx = await bridgeWithClients({ exitDuringProviders: true });
+  t.after(ctx.restore);
+  await bridgeWithClientsStart(ctx.bridge);
+
+  const outcome = await ctx.bridge.setUpstreamMode('masquerade').then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+
+  assert.equal(outcome.error?.code, 'upstream_disconnected');
+  assert.equal(ctx.bridge.state.mode, 'masquerade');
+  assert.equal(ctx.bridge.client.ready, false);
+  assert.equal(ctx.bridge.snapshot().phase, 'error');
+  assert.equal(ctx.bridge.snapshot().errorCode, 'upstream_disconnected');
+  assert.equal(ctx.bridge.snapshot().upstream.ready, false);
+});
+
+test('切换恢复等待 providers 时主动 stop，拒绝后取消且保留 idle 状态', async (t) => {
+  let signalProvidersStarted;
+  const providersStarted = new Promise((resolve) => { signalProvidersStarted = resolve; });
+  let rejectProviders;
+  const ctx = await bridgeWithClients({
+    masqueradeProviders: () => new Promise((_, reject) => {
+      rejectProviders = reject;
+      signalProvidersStarted();
+    }),
+  });
+  t.after(ctx.restore);
+  await bridgeWithClientsStart(ctx.bridge);
+
+  const switching = ctx.bridge.setUpstreamMode('masquerade').then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  await providersStarted;
+  await ctx.bridge.stop({ uninstall: false });
+  rejectProviders(new Error('模拟停止期间目录请求结束'));
+  const outcome = await switching;
+
+  assert.equal(outcome.error?.code, 'operation_cancelled');
+  assert.equal(ctx.bridge.snapshot().phase, 'idle');
+  assert.equal(ctx.bridge.snapshot().error, null);
+  assert.equal(ctx.bridge.snapshot().errorCode, null);
+  assert.equal(ctx.bridge.snapshot().upstream.ready, false);
 });
 
 test('setUpstreamMode：新方案起不来时原地回滚（设置、客户端、判定都不动）', async (t) => {

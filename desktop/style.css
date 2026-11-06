@@ -490,6 +490,10 @@ code {
   color: var(--muted);
 }
 
+.target-picker-note.is-warning {
+  color: var(--warn);
+}
+
 .target-picker-list {
   display: flex;
   flex-direction: column;
@@ -1090,6 +1094,11 @@ code {
   color: var(--bad);
 }
 
+.notice.is-warning {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
 .notice.is-ok {
   background: var(--ok-soft);
   color: var(--ok);
@@ -1173,6 +1182,11 @@ code {
   font-size: 12.5px;
 }
 
+.settings input[aria-invalid='true'] {
+  border-color: var(--bad);
+  outline: 1px solid var(--bad);
+}
+
 .settings input[type='checkbox'] {
   accent-color: var(--accent);
 }
@@ -1228,6 +1242,17 @@ code {
 .statusbar #status-text {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.statusbar .status-help {
+  flex: 1 1 100%;
+  min-width: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.statusbar[data-state='error'] .status-help {
+  color: var(--bad);
 }
 
 .statusbar .lead .dot {

@@ -71,14 +71,34 @@
      * 订阅状态。桌面版是主进程推送，这里用轮询——面板很轻，
      * 一次状态查询就是读内存，1.5 秒一次不心疼。
      */
-    onState(callback) {
+    onState(callback, onConnectionError) {
       let stopped = false;
+      let inFlight = false;
       const tick = async () => {
-        if (stopped) return;
+        if (stopped || inFlight) return;
+        inFlight = true;
         try {
-          callback(await api('/api/state'));
-        } catch {
-          /* 一次失败不打断轮询，接下来还会再试 */
+          let snapshot;
+          try {
+            snapshot = await api('/api/state');
+          } catch (error) {
+            if (!stopped && typeof onConnectionError === 'function') {
+              try {
+                onConnectionError(error);
+              } catch {
+                /* 连接错误回调不能中断后续轮询 */
+              }
+            }
+            return;
+          }
+          if (stopped) return;
+          try {
+            callback(snapshot);
+          } catch {
+            /* 回调错误不能中断后续轮询 */
+          }
+        } finally {
+          inFlight = false;
         }
       };
       tick();

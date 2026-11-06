@@ -6,6 +6,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { ZenClient } from '../src/zen-client.js';
 import { OPENCODE_ID_PATTERN, OPENCODE_TOOL_DESCRIPTIONS, OPENCODE_USER_AGENT } from '../src/zen-impersonate.js';
@@ -219,6 +222,35 @@ const stub = await makeZenStub();
 test.after(() => stub.close());
 
 const chatPosts = () => stub.requests.filter((r) => r.path === '/inference/openai/v1/chat/completions');
+
+test('伪装模式侧车意外退出时 ready 变 false 并通知调用方', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'oc-zen-client-exit-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const sidecar = join(dir, 'exit.js');
+  await writeFile(sidecar, "console.log(JSON.stringify({ ready: true, url: 'http://127.0.0.1:43212' })); setTimeout(() => process.exit(24), 20);\n");
+  const exits = [];
+  let resolveExit;
+  const exit = new Promise((resolve) => { resolveExit = resolve; });
+  const client = new ZenClient({
+    baseUrl: 'https://opencode.ai',
+    modelsDevUrl: 'https://models.dev',
+    bunPath: process.execPath,
+    sidecarPath: sidecar,
+    onExit: (detail) => { exits.push(detail); resolveExit(detail); },
+  });
+  t.after(() => client.stop());
+  await client.start();
+  assert.equal(client.ready, true);
+
+  const detail = await Promise.race([
+    exit,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('侧车退出通知超时')), 2_000)),
+  ]);
+
+  assert.equal(detail.code, 24);
+  assert.equal(client.ready, false);
+  assert.deepEqual(exits, [{ code: 24, signal: null }]);
+});
 
 /* ------------------------------------------------------------------ */
 /* 目录                                                                */

@@ -324,6 +324,7 @@ export class OcClient {
    * @param {string} [o.workdir]      OpenCode 会话的工作目录；默认 `${dataDir}/workspace`
    * @param {object} [o.env]          额外环境变量
    * @param {(line:string)=>void} [o.onLog]
+   * @param {(detail:{code:number|null,signal:string|null})=>void} [o.onExit] 运行中意外退出通知
    */
   constructor(o = {}) {
     if (!o || typeof o.dataDir !== 'string' || o.dataDir.length === 0) {
@@ -345,6 +346,7 @@ export class OcClient {
     this.workdir = o.workdir ?? (this.isolate ? join(this.runtimeRoot, 'project') : join(o.dataDir, 'workspace'));
     this.env = o.env && typeof o.env === 'object' ? o.env : {};
     this.onLog = typeof o.onLog === 'function' ? o.onLog : () => {};
+    this.onExit = typeof o.onExit === 'function' ? o.onExit : () => {};
 
     this.child = null;
     this.port = null;
@@ -907,9 +909,17 @@ export class OcClient {
       this.exited = true;
     });
     child.once('exit', (code, signal) => {
+      const wasStarted = this.started;
       this.exited = true;
       this.started = false;
       this._log(`[opencode 退出] code=${code} signal=${signal}`);
+      if (wasStarted && !this._stopping) {
+        try {
+          this.onExit({ code, signal });
+        } catch {
+          // 调用方的状态回调不能影响子进程收尾
+        }
+      }
     });
 
     const deadline = Date.now() + DEFAULT_READY_TIMEOUT_MS;

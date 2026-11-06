@@ -10,8 +10,8 @@
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| macOS（Apple Silicon） | `OC.Faucet-1.0.2-arm64.dmg` | 打开拖进「应用程序」 |
-| Windows（64 位） | `OC.Faucet-Setup-1.0.2.exe` | 双击安装 |
+| macOS（Apple Silicon） | `OC.Faucet-1.0.3-arm64.dmg` | 打开拖进「应用程序」 |
+| Windows（64 位） | `OC.Faucet.Setup.1.0.3.exe` | 双击安装 |
 
 也可以从源码跑（需要 Node.js ≥ 22 和本机装有 [OpenCode](https://opencode.ai)）。内嵌模式支持 OpenCode 1.x 和 2.x，启动时会自动识别主版本并选择对应的启动参数与 API：
 

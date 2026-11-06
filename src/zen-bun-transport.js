@@ -48,11 +48,12 @@ export function resolveSidecarPath(explicit) {
 
 /** Bun 只负责跨网络请求；协议、重试和解析仍由 ZenClient 负责。 */
 export class BunTransport {
-  constructor({ baseOrigin, bunPath, sidecarPath, log = () => {} } = {}) {
+  constructor({ baseOrigin, bunPath, sidecarPath, log = () => {}, onExit = () => {} } = {}) {
     this.baseOrigin = baseOrigin;
     this.bunPath = bunPath;
     this.sidecarPath = sidecarPath;
     this.log = log;
+    this.onExit = typeof onExit === 'function' ? onExit : () => {};
     this.child = null;
     this.endpoint = null;
     this.starting = null;
@@ -144,8 +145,11 @@ export class BunTransport {
         finish(new BridgeError(`启动 Bun 侧车失败：${error.message}`, 500, 'bun_start_failed'));
       });
       child.once('exit', (code) => {
-        this.endpoint = null;
-        this.child = null;
+        const unexpected = this.child === child;
+        if (unexpected) {
+          this.endpoint = null;
+          this.child = null;
+        }
         if (!settled) {
           finish(new BridgeError(
             `Bun 侧车启动后退出了（code=${code}）：${stderr.trim() || '没有输出'}`,
@@ -154,6 +158,13 @@ export class BunTransport {
           ));
         } else {
           this.log(`[伪装] Bun 侧车退出：code=${code}`);
+          if (unexpected) {
+            try {
+              this.onExit({ code, signal: child.signalCode ?? null });
+            } catch {
+              // 调用方的状态回调不能影响侧车收尾
+            }
+          }
         }
       });
     });

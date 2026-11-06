@@ -13,12 +13,22 @@ const byId = (id) => document.getElementById(id);
 let snapshot = { models: [], phase: 'starting', progress: null };
 /** 方案切换进行中：两个按钮都先禁用，免得连点 */
 let switchingMode = false;
+let probingAll = false;
+let restarting = false;
 let openRowId = null;
 const testingIds = new Set();
 const contextWindowDrafts = new Map();
 // 目标勾选区：当前展开的是哪个目标、勾了哪些模型（轮询重画时要保住）
 let openTargetPickerId = null;
 const targetPickerDraft = new Map();
+const actionVersions = new Map();
+const noticeErrors = new Map();
+let noticeSequence = 0;
+let transientNotice = null;
+let latestStateRequest = 0;
+let stateRevision = 0;
+let webDisconnected = false;
+let expectedWebStop = false;
 
 /* ------------------------------------------------------------------ */
 /* 极小的 DOM 工具                                                     */
@@ -183,17 +193,78 @@ function initTheme() {
 
 let noteTimer = null;
 
-function note(message, kind = '') {
+function beginAction(scope) {
+  const version = (actionVersions.get(scope) ?? 0) + 1;
+  actionVersions.set(scope, version);
+  return { scope, version, startedAt: Date.now() };
+}
+
+function renderNotice() {
   const node = byId('notice');
-  if (!message) {
+  const latestError = [...noticeErrors.values()].sort((a, b) => b.sequence - a.sequence)[0];
+  const visible = latestError ?? transientNotice;
+  if (!visible) {
     node.hidden = true;
     return;
   }
-  node.textContent = message;
-  node.className = `notice${kind ? ` is-${kind}` : ''}`;
+  node.textContent = visible.message;
+  node.className = `notice${visible.kind ? ` is-${visible.kind}` : ''}`;
   node.hidden = false;
+}
+
+/** 错误按动作归属；成功只清该动作的旧错误，旧请求结果不能盖过新操作。 */
+function note(message, kind = '', action = null) {
+  if (action && actionVersions.get(action.scope) !== action.version) return;
+
+  if (!message) {
+    if (action) noticeErrors.delete(action.scope);
+    else transientNotice = null;
+    renderNotice();
+    return;
+  }
+
   clearTimeout(noteTimer);
-  if (kind !== 'error') noteTimer = setTimeout(() => (node.hidden = true), 6000);
+  noteTimer = null;
+
+  if (kind === 'error' || kind === 'warning') {
+    const scope = action?.scope ?? 'global';
+    noticeErrors.set(scope, {
+      message,
+      kind,
+      startedAt: action?.startedAt ?? Date.now(),
+      modelBaselines: action?.modelBaselines ? new Map(action.modelBaselines) : null,
+      failedModelIds: action?.failedModelIds ? new Set(action.failedModelIds) : new Set(),
+      expectedFailed: Number(action?.expectedFailed) || 0,
+      recoveredCount: 0,
+      sequence: ++noticeSequence,
+    });
+    transientNotice = null;
+    renderNotice();
+    return;
+  }
+
+  if (kind === 'ok' && action) noticeErrors.delete(action.scope);
+  if (noticeErrors.size) {
+    transientNotice = null;
+    renderNotice();
+    return;
+  }
+
+  const sequence = ++noticeSequence;
+  transientNotice = { message, kind, sequence };
+  renderNotice();
+  if (kind !== 'warning') {
+    noteTimer = setTimeout(() => {
+      if (transientNotice?.sequence !== sequence) return;
+      transientNotice = null;
+      renderNotice();
+    }, 6000);
+  }
+}
+
+function clearNotice(scope) {
+  noticeErrors.delete(scope);
+  renderNotice();
 }
 
 /* ------------------------------------------------------------------ */
@@ -261,7 +332,8 @@ function copyButton(text) {
 /* ------------------------------------------------------------------ */
 
 function isBusy() {
-  return snapshot.phase === 'starting' || snapshot.phase === 'probing';
+  if (snapshot.phase === 'probing') return true;
+  return snapshot.phase === 'starting' && !snapshot.error && !snapshot.errorCode;
 }
 
 function renderTop() {
@@ -272,9 +344,9 @@ function renderTop() {
 
   let state = 'busy';
   let label = '正在启动';
-  if (snapshot.error) {
+  if (webDisconnected || snapshot.error || snapshot.errorCode || snapshot.phase === 'idle' || (snapshot.phase === 'ready' && snapshot.upstream?.ready === false)) {
     state = 'error';
-    label = '出错了';
+    label = webDisconnected ? '面板连接已断开' : snapshot.phase === 'idle' ? '已停止' : snapshot.errorCode === 'upstream_disconnected' ? '上游已断开' : '出错了';
   } else if (snapshot.phase === 'probing') {
     label = snapshot.progress?.total
       ? `检测中 ${snapshot.progress.done}/${snapshot.progress.total}`
@@ -296,13 +368,14 @@ function renderTop() {
 
 function renderActions() {
   const locked = isBusy();
+  const probeLocked = locked || probingAll || testingIds.size > 0;
   byId('act-read').disabled = locked;
-  byId('act-test').disabled = locked || !snapshot.models.length;
-  byId('act-retest').disabled = locked || !snapshot.models.length;
+  byId('act-test').disabled = probeLocked || !snapshot.models.length;
+  byId('act-retest').disabled = probeLocked || !snapshot.models.length;
 
   // 服务控制：忙的时候不许动；已经停了就只剩「重启服务」（等于再拉起来）
   const stopped = snapshot.phase === 'idle';
-  byId('act-restart').disabled = locked;
+  byId('act-restart').disabled = locked || restarting;
   byId('act-stop').disabled = locked || stopped;
 }
 
@@ -310,12 +383,22 @@ function renderStatus() {
   const bar = byId('statusbar');
   const lead = byId('status-text');
   const progress = byId('status-progress');
+  const help = byId('status-help');
+  const errorCode = snapshot.errorCode ?? '';
+  const disconnected = errorCode === 'upstream_disconnected' || (snapshot.phase === 'ready' && snapshot.upstream?.ready === false);
 
   let state = 'busy';
   let text = '正在启动隔离的 OpenCode';
-  if (snapshot.error) {
+  if (webDisconnected) {
     state = 'error';
-    text = `出错了：${snapshot.error}`;
+    text = '网页面板与本机服务断开';
+  } else if (snapshot.error || errorCode || disconnected) {
+    state = 'error';
+    text = snapshot.error
+      ? `出错了：${snapshot.error}`
+      : disconnected
+        ? '上游连接已断开'
+        : '服务没有启动成功';
   } else if (snapshot.phase === 'probing') {
     text = '正在逐个检测模型';
   } else if (snapshot.phase === 'ready') {
@@ -326,8 +409,30 @@ function renderStatus() {
     text = '已停止';
   }
 
+  let guidance = '';
+  if (webDisconnected) {
+    guidance = '正在自动重试连接；如果长时间无法恢复，请从终端重新打开控制面板地址。';
+  } else if (snapshot.phase === 'idle' && !snapshot.error && !errorCode) {
+    guidance = '服务已停止。点“启动服务”重新运行。';
+  } else if (errorCode === 'runtime_missing') {
+    guidance = snapshot.mode === 'masquerade'
+      ? '伪装方案的内置运行组件无法启动。请检查或重新安装应用，再查看请求日志后重试。'
+      : '没有找到可运行的 OpenCode。安装或修复 OpenCode 后点“重试服务”；也可以切到伪装方案。';
+  } else if (errorCode === 'upstream_not_ready') {
+    guidance = '上游启动未就绪。查看请求日志，处理原因后点“重试服务”。';
+  } else if (disconnected) {
+    guidance = '上游运行中断开。查看请求日志后点“重试服务”；重试会先确认是否中断正在进行的请求。';
+  } else if (snapshot.error || errorCode) {
+    guidance = '查看请求日志了解原因，处理后点“重试服务”。';
+  }
+
   bar.dataset.state = state;
   lead.textContent = text;
+  help.textContent = guidance;
+  help.hidden = !guidance;
+  const restart = byId('act-restart');
+  restart.textContent = webDisconnected ? '连接中断' : snapshot.phase === 'idle' ? '启动服务' : (snapshot.error || errorCode || disconnected) ? '重试服务' : '重启服务';
+  restart.title = snapshot.phase === 'idle' ? '重新启动转发口和上游' : '重启转发口和上游（会先确认正在进行的请求是否中断）';
 
   if (snapshot.phase === 'probing' && snapshot.progress?.total) {
     progress.hidden = false;
@@ -346,7 +451,7 @@ function renderMode() {
   const mode = snapshot.mode === 'masquerade' ? 'masquerade' : 'embedded';
   byId('mode-embedded').setAttribute('aria-pressed', String(mode === 'embedded'));
   byId('mode-masquerade').setAttribute('aria-pressed', String(mode === 'masquerade'));
-  const busy = switchingMode || isBusy();
+  const busy = switchingMode || isBusy() || probingAll || testingIds.size > 0;
   byId('mode-embedded').disabled = busy;
   byId('mode-masquerade').disabled = busy;
 }
@@ -391,7 +496,7 @@ function renderList() {
     retest.setAttribute('aria-label', `只重测 ${model.name}`);
     const spinning = testingIds.has(model.id);
     if (spinning) retest.classList.add('is-spinning');
-    retest.disabled = isBusy() || spinning;
+    retest.disabled = isBusy() || probingAll || spinning;
     retest.append(glyph('again'));
     retest.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -513,6 +618,7 @@ function detailBlock(model) {
   const tools = h('div', 'detail-actions');
   const again = h('button', '', '只重测这一个');
   again.type = 'button';
+  again.disabled = isBusy() || probingAll || testingIds.has(model.id);
   again.addEventListener('click', (event) => {
     event.stopPropagation();
     retestOne(model.id);
@@ -619,6 +725,7 @@ async function saveContextWindow(id, value) {
   if (!draft || draft.saving) return;
 
   let nextValue = value;
+  const action = beginAction(`context-window:${id}`);
   if (value !== null) {
     nextValue = parseContextWindow(draft.value);
     if (nextValue === null) {
@@ -636,6 +743,7 @@ async function saveContextWindow(id, value) {
   } catch (error) {
     draft.saving = false;
     draft.error = `保存失败：${error?.message ?? error}`;
+    note(draft.error, 'error', action);
     renderList();
     return;
   }
@@ -645,18 +753,18 @@ async function saveContextWindow(id, value) {
   try {
     next = await window.oc.getState();
     if (!next) throw new Error('没有读到更新后的状态');
-    snapshot = next;
+    applySnapshot(next);
   } catch (error) {
     render();
-    note(`已保存，但暂时没能读取新状态：${error?.message ?? error}；稍后会自动刷新`, 'error');
+    note(`已保存，但暂时没能读取新状态：${error?.message ?? error}；稍后会自动刷新`, 'error', action);
     return;
   }
   render();
   const updatedModel = snapshot.models?.find((model) => model.id === id);
   if (updatedModel?.contextWindowPending) {
-    note('窗口设置已记录，但还没全部同步；请重试保存或恢复默认', 'error');
+    note('窗口设置已记录，但还没全部同步；请重试保存或恢复默认', 'error', action);
   } else {
-    note(value === null ? '已恢复上游默认上下文窗口' : '上下文窗口已保存', 'ok');
+    note(value === null ? '已恢复上游默认上下文窗口' : '上下文窗口已保存', 'ok', action);
   }
 }
 
@@ -700,7 +808,10 @@ function emptyBlock() {
   } else if (snapshot.phase === 'ready') {
     box.append(h('h3', '', '没找到免费模型'), h('p', '', '点上面的「读取模型」重新拉一次目录。'));
   } else {
-    box.append(h('h3', '', '正在准备模型服务'), h('p', '', '隔离的 OpenCode 起来后，模型会出现在这里。'));
+    const detail = snapshot.mode === 'masquerade'
+      ? '伪装方案准备好后，模型会出现在这里。'
+      : '隔离的 OpenCode 起来后，模型会出现在这里。';
+    box.append(h('h3', '', '正在准备模型服务'), h('p', '', detail));
   }
   return box;
 }
@@ -741,19 +852,26 @@ function renderKey() {
 
 /** 密钥不进快照，页面起来后显式拉一次 */
 async function loadApiKey() {
-  const res = await call('读取密钥', () => window.oc.getApiKey());
+  const action = beginAction('key:read');
+  const res = await call('读取密钥', () => window.oc.getApiKey(), action);
   if (res && typeof res.key === 'string') {
     apiKey = res.key;
     renderKey();
+    note('', 'ok', action);
   }
 }
 
 async function saveApiKey() {
+  const action = beginAction('key:save');
   const key = byId('key-input').value;
-  const result = await call('保存密钥', () => window.oc.setApiKey(key));
+  const result = await call('保存密钥', () => window.oc.setApiKey(key), action);
   // 失败也可能是「密钥已保存、同步目标失败」（500），所以成败都回拉一次真实值
-  const fresh = await call('读取密钥', () => window.oc.getApiKey());
-  if (fresh && typeof fresh.key === 'string') apiKey = fresh.key;
+  const readAction = beginAction('key:read');
+  const fresh = await call('读取密钥', () => window.oc.getApiKey(), readAction);
+  if (fresh && typeof fresh.key === 'string') {
+    apiKey = fresh.key;
+    note('', 'ok', readAction);
+  }
   if (!result) {
     // 错误文案刚才已弹出（含重试指引）；留在编辑态，改完再点保存即可
     renderKey();
@@ -762,7 +880,7 @@ async function saveApiKey() {
   keyEditing = false;
   keyShown = false;
   renderKey();
-  note('已保存，已写入的目标已同步新密钥', 'ok');
+  note('已保存，已写入的目标已同步新密钥', 'ok', action);
   await refreshSnapshot();
 }
 
@@ -836,6 +954,12 @@ function pickableModels(target) {
   return [...writtenFirst, ...rest];
 }
 
+function savedTargetSelection(target, models) {
+  if (Array.isArray(target.selectedModelIds)) return new Set(target.selectedModelIds);
+  if (target.written && Array.isArray(target.models) && target.models.length) return new Set(target.models);
+  return new Set(models.map((model) => model.id));
+}
+
 function toggleTargetPicker(target) {
   if (openTargetPickerId === target.id) {
     openTargetPickerId = null;
@@ -843,7 +967,8 @@ function toggleTargetPicker(target) {
     return;
   }
   const models = pickableModels(target);
-  targetPickerDraft.set(target.id, new Set(models.map((model) => model.id)));
+  const selected = savedTargetSelection(target, models);
+  targetPickerDraft.set(target.id, new Set(selected));
   openTargetPickerId = target.id;
   renderTargets();
 }
@@ -852,10 +977,26 @@ function toggleTargetPicker(target) {
 function targetPicker(target, usableCount, locked) {
   const box = h('div', 'target-picker');
   const models = pickableModels(target);
-  const checked = targetPickerDraft.get(target.id) ?? new Set(models.map((model) => model.id));
+  let selection = targetPickerDraft.get(target.id);
+  if (!selection) {
+    selection = savedTargetSelection(target, models);
+    targetPickerDraft.set(target.id, selection);
+  }
+  const checked = new Set(models.filter((model) => selection.has(model.id)).map((model) => model.id));
   box.append(h('div', 'target-picker-title', `选哪几个模型写进 ${target.label}（共 ${models.length} 个可勾）`));
 
   if (!usableCount) box.append(h('p', 'target-picker-note', '还没有可用模型，先点上面「检测全部」。'));
+  const savedSelection = Array.isArray(target.selectedModelIds)
+    ? target.selectedModelIds
+    : target.written && Array.isArray(target.models) ? target.models : [];
+  const unavailableSaved = savedSelection.filter((id) => !models.some((model) => model.id === id));
+  if (unavailableSaved.length) {
+    const message = checked.size
+      ? `${unavailableSaved.length} 个已选模型暂不可用；其他模型不会自动替代。`
+      : '已保存的模型当前都不可用；不会自动改选其他模型，请重测或手动选择。';
+    const noteNode = h('p', 'target-picker-note is-warning', message);
+    box.append(noteNode);
+  }
 
   const list = h('div', 'target-picker-list');
   for (const model of models) {
@@ -864,9 +1005,13 @@ function targetPicker(target, usableCount, locked) {
     box2.type = 'checkbox';
     box2.checked = checked.has(model.id);
     box2.addEventListener('change', () => {
-      if (box2.checked) checked.add(model.id);
-      else checked.delete(model.id);
-      targetPickerDraft.set(target.id, checked);
+      if (box2.checked) {
+        checked.add(model.id);
+        selection.add(model.id);
+      } else {
+        checked.delete(model.id);
+        selection.delete(model.id);
+      }
       const confirm = box.querySelector('.target-picker-confirm');
       if (confirm) confirm.disabled = locked || checked.size === 0;
     });
@@ -904,61 +1049,195 @@ function render() {
   renderLan();
 }
 
+/** 状态快照是某次模型判定成功的唯一可靠信号；旧快照不能清除新错误。 */
+function applySnapshot(next) {
+  if (!next || typeof next !== 'object') return false;
+
+  for (const [scope, failure] of noticeErrors) {
+    if (!scope.startsWith('probe:model:')) continue;
+    const modelId = scope.slice('probe:model:'.length);
+    const model = (next.models ?? []).find((item) => item.id === modelId);
+    if (model && usable(model) && Number.isFinite(model.checkedAt) && model.checkedAt > failure.startedAt) {
+      clearNotice(scope);
+    }
+  }
+
+  const aggregate = noticeErrors.get('probe:all');
+  if (aggregate?.expectedFailed > 0) {
+    const models = Array.isArray(next.models) ? next.models : [];
+    for (const model of models) {
+      if (model?.verdict === 'failed') aggregate.failedModelIds.add(model.id);
+    }
+    let recoveredNow = 0;
+    for (const modelId of [...aggregate.failedModelIds]) {
+      const model = models.find((item) => item.id === modelId);
+      if (!model) continue;
+      const baseline = aggregate.modelBaselines?.get(modelId);
+      const newerCheck = Number.isFinite(model.checkedAt) && (!baseline || !Number.isFinite(baseline.checkedAt) || model.checkedAt > baseline.checkedAt);
+      const verdictChanged = !baseline || model.verdict !== baseline.verdict;
+      if (!newerCheck && !verdictChanged) continue;
+      aggregate.modelBaselines?.set(modelId, { checkedAt: model.checkedAt, verdict: model.verdict });
+      if (usable(model)) {
+        aggregate.failedModelIds.delete(modelId);
+        aggregate.recoveredCount += 1;
+        recoveredNow += 1;
+      }
+    }
+    if (aggregate.failedModelIds.size === 0 && aggregate.recoveredCount >= aggregate.expectedFailed) {
+      clearNotice('probe:all');
+    } else if (recoveredNow > 0) {
+      const remaining = Math.max(aggregate.failedModelIds.size, aggregate.expectedFailed - aggregate.recoveredCount);
+      aggregate.message = `检测结果已更新：${aggregate.recoveredCount} 个模型已恢复，仍有 ${remaining} 个不可用。`;
+      aggregate.kind = 'warning';
+      aggregate.sequence = ++noticeSequence;
+      renderNotice();
+    }
+  }
+
+  clearNotice('state:refresh');
+  if (window.oc.panelShell === 'web') {
+    webDisconnected = false;
+    clearNotice('connection:web');
+  }
+  if (next.phase === 'ready' && !next.error && !next.errorCode) {
+    clearNotice('service:mode-pending:embedded');
+    clearNotice('service:mode-pending:masquerade');
+  }
+  snapshot = next;
+  stateRevision += 1;
+  render();
+  return true;
+}
+
+function handleWebConnectionError(error) {
+  if (error) {
+    if (expectedWebStop) return;
+    webDisconnected = true;
+    note('网页面板与本机服务断开，正在自动重试连接。', 'error', beginAction('connection:web'));
+  } else {
+    webDisconnected = false;
+    clearNotice('connection:web');
+  }
+  renderStatus();
+  renderTop();
+}
+
+function receiveSnapshot(next) {
+  applySnapshot(next);
+}
+
 /* ------------------------------------------------------------------ */
 /* 动作                                                                */
 /* ------------------------------------------------------------------ */
 
-async function call(label, fn) {
+async function call(label, fn, action = beginAction(`action:${label}`)) {
   try {
     return await fn();
   } catch (error) {
-    note(`${label}失败：${error?.message ?? error}`, 'error');
+    note(`${label}失败：${error?.message ?? error}`, 'error', action);
     return null;
   }
 }
 
 /** 做完动作立刻回读一次状态，不用等下一轮轮询 */
 async function refreshSnapshot() {
-  const next = await call('刷新状态', () => window.oc.getState());
-  if (next) {
-    snapshot = next;
-    render();
+  const request = ++latestStateRequest;
+  const revision = stateRevision;
+  const action = beginAction('state:refresh');
+  try {
+    const next = await window.oc.getState();
+    if (!next) throw new Error('没有读到状态');
+    if (request !== latestStateRequest || revision !== stateRevision) return;
+    applySnapshot(next);
+  } catch (error) {
+    if (request !== latestStateRequest || revision !== stateRevision) return;
+    note(`刷新状态失败：${error?.message ?? error}`, 'error', action);
   }
 }
 
 async function readModels() {
-  note('正在读取模型目录…');
-  const result = await call('读取', () => window.oc.refresh());
+  const action = beginAction('models:refresh');
+  note('正在读取模型目录…', '', action);
+  const result = await call('读取', () => window.oc.refresh(), action);
   if (!result) return;
-  note(`读到 ${result.models} 个免费模型`, 'ok');
+  note(`读到 ${result.models} 个免费模型`, 'ok', action);
   await refreshSnapshot();
 }
 
 async function testAll(force) {
-  note(force ? '正在强制重测，会消耗多一些免费额度…' : '正在检测，会消耗少量免费额度…');
-  const result = await call('检测', () => window.oc.probe({ force: Boolean(force) }));
-  if (!result) return;
-  const s = result.summary ?? {};
-  const bits = [];
-  if (s.tool) bits.push(`能用工具 ${s.tool}`);
-  if (s.chat) bits.push(`只能聊天 ${s.chat}`);
-  if (s.failed) bits.push(`不可用 ${s.failed}`);
-  note(`检测完成：${bits.join('、') || '一个都没通过'}`, 'ok');
-  await refreshSnapshot();
+  if (probingAll || testingIds.size > 0 || isBusy()) return;
+  const action = beginAction('probe:all');
+  action.modelBaselines = new Map(snapshot.models.map((model) => [model.id, {
+    checkedAt: model.checkedAt,
+    verdict: model.verdict,
+  }]));
+  probingAll = true;
+  renderActions();
+  renderList();
+  note(force ? '正在强制重测，会消耗多一些免费额度…' : '正在检测，会消耗少量免费额度…', '', action);
+  try {
+    const result = await call('检测', () => window.oc.probe({ force: Boolean(force) }), action);
+    if (!result) return;
+    const summary = result.summary ?? {};
+    const tool = Number(summary.tool) || 0;
+    const chat = Number(summary.chat) || 0;
+    const failed = Number(summary.failed) || 0;
+    const total = Number(result.total) || tool + chat + failed;
+    action.expectedFailed = failed;
+    action.failedModelIds = new Set(
+      Array.isArray(result.results)
+        ? result.results.filter((item) => item.verdict === 'failed').map((item) => item.id)
+        : snapshot.models.filter((model) => model.verdict === 'failed').map((model) => model.id),
+    );
+    const bits = [];
+    if (tool) bits.push(`能用工具 ${tool}`);
+    if (chat) bits.push(`只能聊天 ${chat}`);
+    if (failed) bits.push(`不可用 ${failed}`);
+    const summaryText = bits.join('、') || '没有模型返回判定';
+    const detail = '这只代表本轮检测结果，之后可能变化。';
+    const message = total > 0 && failed === total
+      ? `检测完成，但这一轮没有可用模型：${summaryText}。${detail}`
+      : `检测完成：${summaryText}。${detail}`;
+    const kind = total === 0 || failed === total ? 'error' : failed > 0 ? 'warning' : 'ok';
+    note(message, kind, action);
+    await refreshSnapshot();
+  } finally {
+    probingAll = false;
+    renderActions();
+    renderList();
+  }
 }
 
 async function retestOne(id) {
+  if (probingAll || isBusy() || testingIds.has(id)) return;
+  const action = beginAction(`probe:model:${id}`);
   testingIds.add(id);
+  renderActions();
   renderList();
-  const result = await call('重测', () => window.oc.probeOne(id));
-  if (result) note(`重测完成：${verdictText(result)}`, 'ok');
-  testingIds.delete(id);
-  await refreshSnapshot();
+  note(`正在重测 ${id}…`, '', action);
+  try {
+    const result = await call('重测', () => window.oc.probeOne(id), action);
+    if (result) {
+      const failed = result.verdict === 'failed';
+      const chatOnly = result.verdict === 'chat';
+      note(
+        failed ? `${id} 重测完成，但仍不可用。` : chatOnly ? `${id} 有响应，但目前只能聊天。` : `${id} 重测完成：可用。`,
+        failed ? 'error' : 'ok',
+        action,
+      );
+    }
+    await refreshSnapshot();
+  } finally {
+    testingIds.delete(id);
+    renderActions();
+    renderList();
+  }
 }
 
 /** 写入提示：写入了几个、有让位的（撞了用户手写条目）要说一声 */
 async function installTarget(target, modelIds) {
-  const result = await call('写入', () => window.oc.installTarget(target.id, modelIds));
+  const action = beginAction(`target:install:${target.id}`);
+  const result = await call('写入', () => window.oc.installTarget(target.id, modelIds), action);
   if (!result) return;
   openTargetPickerId = null;
   const added = result.added ?? 0;
@@ -973,7 +1252,7 @@ async function installTarget(target, modelIds) {
   if (skipped > 0) bits.push(`${skipped} 个模型和你手写的条目重名，已让位、没动你的`);
   if (result.disabledBuiltins) bits.push(`顺手摘掉了 ${result.disabledBuiltins} 个借来的模型名`);
   if (target.id === 'zcode' && result.changed !== false) bits.push('重启 ZCode 生效');
-  note(bits.join('，'), 'ok');
+  note(bits.join('，'), 'ok', action);
   await refreshSnapshot();
 }
 
@@ -982,9 +1261,10 @@ async function uninstallTarget(target) {
     `确定把 OC Faucet 从 ${target.label} 里移除吗？\n\n只会删掉 OC Faucet 自己写入的内容，你手动加的其它配置不受影响。`,
   );
   if (!yes) return;
-  const result = await call('移除', () => window.oc.uninstallTarget(target.id));
+  const action = beginAction(`target:uninstall:${target.id}`);
+  const result = await call('移除', () => window.oc.uninstallTarget(target.id), action);
   if (!result) return;
-  note(`已从 ${target.label} 移除 ${result.removed ?? 0} 个模型`, 'ok');
+  note(`已从 ${target.label} 移除 ${result.removed ?? 0} 个模型`, 'ok', action);
   await refreshSnapshot();
 }
 
@@ -992,32 +1272,50 @@ async function uninstallTarget(target) {
 async function switchUpstreamMode(mode) {
   if (switchingMode) return;
   if ((snapshot.mode === 'masquerade' ? 'masquerade' : 'embedded') === mode) return;
+  const action = beginAction('service:mode-switch');
   switchingMode = true;
   renderMode();
-  note(mode === 'masquerade' ? '正在切换到伪装方案（启动 Bun 侧车）…' : '正在切换到内嵌方案…');
-  const result = await call('切换方案', () => window.oc.setUpstreamMode(mode));
-  switchingMode = false;
+  note(mode === 'masquerade' ? '正在切换到伪装方案（启动 Bun 侧车）…' : '正在切换到内嵌方案…', '', action);
+  let result;
+  try {
+    result = await call('切换方案', () => window.oc.setUpstreamMode(mode), action);
+  } finally {
+    switchingMode = false;
+    renderMode();
+  }
   await refreshSnapshot();
   if (result) {
-    note(mode === 'masquerade' ? '已切到伪装方案（内置 Bun 侧车直连 zen 免费池）' : '已切到内嵌方案（隔离 OpenCode）', 'ok');
+    if (result.requiresStart === true) {
+      clearNotice(`service:mode-pending:${mode === 'masquerade' ? 'embedded' : 'masquerade'}`);
+      note(mode === 'masquerade' ? '已保存伪装方案。服务当前未运行，点“启动服务”后生效。' : '已保存内嵌方案。服务当前未运行，点“启动服务”后生效。', 'ok', action);
+      const pending = beginAction(`service:mode-pending:${mode}`);
+      note('服务未运行，当前选择的方案要等启动服务后才会生效。', 'warning', pending);
+    } else {
+      clearNotice('service:mode-pending:embedded');
+      clearNotice('service:mode-pending:masquerade');
+      note(mode === 'masquerade' ? '已切到伪装方案（内置 Bun 侧车直连 zen 免费池）' : '已切到内嵌方案（隔离 OpenCode）', 'ok', action);
+    }
   }
 }
 
 /** 路由器广播：开 = 转发口对局域网开放（热重绑，端口/密钥不变） */
 async function toggleLanAccess() {
+  const action = beginAction('network:lan-access');
   const enable = !(snapshot.lanAccess === true);
-  note(enable ? '正在开启路由器广播…' : '正在关闭路由器广播…');
-  const result = await call('切换局域网访问', () => window.oc.setLanAccess(enable));
+  note(enable ? '正在开启路由器广播…' : '正在关闭路由器广播…', '', action);
+  const result = await call('切换局域网访问', () => window.oc.setLanAccess(enable), action);
   await refreshSnapshot();
   if (!result) return;
-  note(enable ? '路由器广播已开启：局域网设备可凭密钥接入' : '路由器广播已关闭：转发口回到只听本机', 'ok');
+  note(enable ? '路由器广播已开启：局域网设备可凭密钥接入' : '路由器广播已关闭：转发口回到只听本机', 'ok', action);
   if (enable) showLanConfig();
 }
 
 /** 局域网配置弹窗：地址、密钥、教程（模型 id 点一下就复制） */
 async function showLanConfig() {
-  const info = await call('局域网配置', () => window.oc.lanInfo());
+  const action = beginAction('network:lan-info');
+  const info = await call('局域网配置', () => window.oc.lanInfo(), action);
   if (!info) return;
+  note('', 'ok', action);
   const box = byId('lan-addresses');
   box.replaceChildren();
   const addresses = info.addresses?.length ? info.addresses : [];
@@ -1060,19 +1358,33 @@ async function showLanConfig() {
 
 /** 重启服务：只重启转发口和 OpenCode，控制面板不关；各接入工具的配置不动 */
 async function restartService() {
-  const yes = window.confirm(
-    '重启会把转发口和隔离的 OpenCode 先关掉再拉起来，正在进行的请求会中断。\n\n各接入工具里已写入的配置不会被改动。继续吗？',
-  );
-  if (!yes) return;
-  note('正在重启服务…');
-  const next = await call('重启', () => window.oc.restart());
-  if (!next) {
-    await refreshSnapshot();
-    return;
+  if (restarting) return;
+  const stopped = snapshot.phase === 'idle';
+  if (!stopped) {
+    const yes = window.confirm(
+      '重启会把转发口和上游先关掉再拉起来，正在进行的请求会中断。\n\n各接入工具里已写入的配置不会被改动。继续吗？',
+    );
+    if (!yes) return;
   }
-  snapshot = next;
-  render();
-  note(next.port ? `服务已重启，转发口 127.0.0.1:${next.port}` : '服务已重启', 'ok');
+  const action = beginAction('service:restart');
+  restarting = true;
+  renderActions();
+  note(stopped ? '正在启动服务…' : '正在重启服务…', '', action);
+  try {
+    const next = await call(stopped ? '启动服务' : '重启', () => window.oc.restart(), action);
+    if (!next) {
+      await refreshSnapshot();
+      return;
+    }
+    applySnapshot(next);
+    if (next.phase === 'ready' && !next.error && !next.errorCode) {
+      clearNotice(`service:mode-pending:${next.mode === 'masquerade' ? 'masquerade' : 'embedded'}`);
+    }
+    note(next.port ? `服务已就绪，转发口 127.0.0.1:${next.port}` : '服务已启动', 'ok', action);
+  } finally {
+    restarting = false;
+    renderActions();
+  }
 }
 
 /** 关闭服务：停掉转发口和 OpenCode；关停前会把写入各接入工具的配置一并摘除 */
@@ -1086,48 +1398,75 @@ async function stopService() {
     `关闭后转发口会停掉，写入各接入工具的 OC Faucet 配置会被一并摘除。${where}\n\n之后重新启动，在「一键接入」区按需再写入即可。继续吗？`,
   );
   if (!yes) return;
-  note('正在关闭服务…');
-  const result = await call('关闭', () => window.oc.stop());
+  const action = beginAction('service:stop');
+  note('正在关闭服务…', '', action);
+  const result = await call('关闭', () => window.oc.stop(), action);
   if (!result) return;
 
   if (result.stopping) {
     // Web 版：服务连面板一起退出，这个页面不会再收到状态了
-    snapshot = { ...snapshot, phase: 'idle', error: null, progress: null, port: null, upstream: { ready: false, baseUrl: null } };
-    render();
-    note('服务已关闭，这个面板也停了，可以直接关掉页面。', 'ok');
+    expectedWebStop = true;
+    applySnapshot({ ...snapshot, phase: 'idle', error: null, errorCode: null, progress: null, port: null, upstream: { ready: false, baseUrl: null } });
+    note('服务已关闭，这个面板也停了，可以直接关掉页面。', 'ok', action);
     return;
   }
 
   // 桌面版：窗口留着，转发口停了，随时可以点「重启服务」再拉起来
-  snapshot = result;
-  render();
-  note('服务已关闭。点「重启服务」可以再拉起来。', 'ok');
+  applySnapshot(result);
+  note('服务已关闭。点「启动服务」可以再拉起来。', 'ok', action);
 }
 
 async function whereIs(which) {
-  const result = await call('查看路径', () =>
-    which === 'config' ? window.oc.openZcodeConfig() : window.oc.openLog(),
+  const action = beginAction(`path:${which}`);
+  const result = await call(
+    '查看路径',
+    () => (which === 'config' ? window.oc.openZcodeConfig() : window.oc.openLog()),
+    action,
   );
   if (!result) return;
   // opened === false 表示这个壳子打不开访达（浏览器版），那就把路径给人自己复制
-  note(result.opened === false ? `路径：${result.file}` : `已打开：${result.file}`, 'ok');
+  note(result.opened === false ? `路径：${result.file}` : `已打开：${result.file}`, 'ok', action);
 }
 
 async function loadSettings() {
-  const s = await call('读取设置', () => window.oc.getSettings());
+  const action = beginAction('settings:read');
+  const s = await call('读取设置', () => window.oc.getSettings(), action);
   if (!s) return;
   byId('cfg-concurrency').value = s.probeConcurrency;
   byId('cfg-ttl').value = s.probeTtlMinutes;
+  byId('cfg-concurrency').setAttribute('aria-invalid', 'false');
+  byId('cfg-ttl').setAttribute('aria-invalid', 'false');
+  note('', 'ok', action);
 }
 
 async function saveSettings() {
-  const saved = await call('保存设置', () =>
-    window.oc.saveSettings({
-      probeConcurrency: Number(byId('cfg-concurrency').value),
-      probeTtlMinutes: Number(byId('cfg-ttl').value),
-    }),
-  );
-  if (saved) note('设置已保存', 'ok');
+  const concurrencyInput = byId('cfg-concurrency');
+  const ttlInput = byId('cfg-ttl');
+  const probeConcurrency = Number(concurrencyInput.value);
+  const probeTtlMinutes = Number(ttlInput.value);
+  const invalidConcurrency = !Number.isInteger(probeConcurrency) || probeConcurrency < 1 || probeConcurrency > 6;
+  const invalidTtl = !Number.isFinite(probeTtlMinutes) || probeTtlMinutes <= 0;
+  const action = beginAction('settings:save');
+
+  concurrencyInput.setAttribute('aria-invalid', String(invalidConcurrency));
+  ttlInput.setAttribute('aria-invalid', String(invalidTtl));
+  if (invalidConcurrency || invalidTtl) {
+    const problem = invalidConcurrency && invalidTtl
+      ? '检测并发必须是 1–6 的整数，判定有效期必须是大于 0 的有限数字。'
+      : invalidConcurrency
+        ? '检测并发必须是 1–6 的整数。'
+        : '判定有效期必须是大于 0 的有限数字。';
+    note(`设置无效：${problem}`, 'error', action);
+    return;
+  }
+
+  const saved = await call('保存设置', () => window.oc.saveSettings({ probeConcurrency, probeTtlMinutes }), action);
+  if (!saved) return;
+  if (Number.isInteger(saved.probeConcurrency)) concurrencyInput.value = saved.probeConcurrency;
+  if (Number.isFinite(saved.probeTtlMinutes) && saved.probeTtlMinutes > 0) ttlInput.value = saved.probeTtlMinutes;
+  concurrencyInput.setAttribute('aria-invalid', 'false');
+  ttlInput.setAttribute('aria-invalid', 'false');
+  note('设置已保存', 'ok', action);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1192,11 +1531,7 @@ function start() {
   wire();
   renderKey(); // 密钥还没拉到：先画打码态，按钮置灰
 
-  window.oc.onState((next) => {
-    if (!next) return;
-    snapshot = next;
-    render();
-  });
+  window.oc.onState(receiveSnapshot, handleWebConnectionError);
 
   // 桌面壳的 onState 只是被动收主进程推送（动作后才发），闲置时外部手改目标配置
   // 不会反映上来；Web 壳的 onState 自己就在 1.5s 轮询（web/web-client.js），不用补。

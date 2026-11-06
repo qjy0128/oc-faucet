@@ -71,6 +71,8 @@ export class Bridge {
     this.cache = null;
     this.activePromptCount = 0;
     this.activeRefreshCount = 0;
+    this.probeAllInFlight = false;
+    this.probeModelIds = new Set();
     this.contextWindowChangeInFlight = false;
     this.contextWindowChangePromise = null;
     this.resolveContextWindowChange = null;
@@ -79,13 +81,14 @@ export class Bridge {
     this.targets = targets ?? createTargets();
     // 上游客户端工厂：默认按方案造真的（内嵌 OpenCode / Bun 侧车直连 zen）；
     // makeClient 参数是留给测试的另一条缝（塞假客户端，不触网不起进程）
-    this.#clientFactory = makeClient ?? ((mode) => this.#makeClient(mode));
+    this.#clientFactory = makeClient ?? ((mode, options) => this.#makeClient(mode, options));
     // 失败自动重试的节奏（默认 10 分钟，与失败判定的短 TTL 对齐；测试可调小）
     this.autoRetryIntervalMs =
       Number.isFinite(autoRetryIntervalMs) && autoRetryIntervalMs > 0 ? autoRetryIntervalMs : 10 * 60 * 1000;
     this.state = {
       phase: 'idle', // idle | starting | ready | probing | error
       error: null,
+      errorCode: null,
       // 上游方案：embedded = 内嵌隔离 OpenCode；masquerade = Bun 侧车逐字节伪装并直连 zen
       mode: 'embedded',
       models: [], // 全部模型（含未通过的）
@@ -106,6 +109,7 @@ export class Bridge {
     return {
       phase: this.state.phase,
       error: this.state.error,
+      errorCode: this.state.errorCode ?? null,
       mode: this.state.mode,
       lanAccess: this.state.lanAccess === true,
       port: this.state.port,
@@ -164,22 +168,28 @@ export class Bridge {
 
   #clientFactory;
   #autoRetryTimer = null;
+  #expectedClientExits = new WeakSet();
 
   /** 按当前方案造一个上游客户端（内嵌 OpenCode，或 Bun 侧车直连 zen） */
-  #makeClient(mode) {
+  #makeClient(mode, { onExit } = {}) {
     if (mode === 'masquerade') {
-      return new ZenClient({ onLog: (line) => this.log(line) });
+      return new ZenClient({ onLog: (line) => this.log(line), onExit });
     }
     return new OcClient({
       dataDir: settings.dataDir(),
       workdir: settings.workspaceDir(),
       onLog: (line) => this.log(line),
+      onExit,
     });
   }
 
   /** 启动：准备目录 → 起上游（按方案）→ 起转发口 */
   async start() {
     this.state.phase = 'starting';
+    this.state.error = null;
+    this.state.errorCode = null;
+    this.state.port = null;
+    this.state.upstream = { ready: false, baseUrl: null };
     try {
       await settings.ensureLayout();
       this.state.apiKey = await settings.apiKey();
@@ -188,11 +198,17 @@ export class Bridge {
 
       const settingsNow = await settings.readSettings();
       this.state.mode = settingsNow.upstreamMode === 'masquerade' ? 'masquerade' : 'embedded';
-      this.client = this.#clientFactory(this.state.mode);
-      await this.client.start();
+      const client = this.#clientFactory(this.state.mode, {
+        onExit: (detail) => this.#handleUpstreamExit(client, detail),
+      });
+      this.client = client;
+      await client.start();
+      if (!client.ready) {
+        throw new BridgeError('上游启动后马上断开，服务没有就绪。请重启服务再试。', 502, 'upstream_not_ready');
+      }
       // 伪装模式 isolate=false，这一步自动跳过（它没有 OpenCode 全局配置可写）
       await this.#applyPersistedContextWindows();
-      this.state.upstream = { ready: true, baseUrl: this.client.baseUrl };
+      this.state.upstream = { ready: false, baseUrl: this.client.baseUrl };
 
       const port = await settings.resolvePort();
       // 路由器广播：默认只绑回环；开了才绑全地址（密钥与 Origin 围栏照旧）
@@ -214,6 +230,10 @@ export class Bridge {
       this.state.zcode = await zcode.status();
       // 顺带把逐目标状态也实读一遍：崩溃重启后，快照按配置文件的真实内容显示
       await this.listTargetStates();
+      if (!client.ready) {
+        throw new BridgeError('上游在服务启动完成前断开了，请重启服务再试。', 502, 'upstream_not_ready');
+      }
+      this.state.upstream = { ready: true, baseUrl: client.baseUrl };
       this.state.phase = 'ready';
       this.log(`OC Faucet 已就绪：转发口 http://127.0.0.1:${this.state.port}`);
       this.#startAutoRetry();
@@ -233,11 +253,53 @@ export class Bridge {
       } catch (error) {
         this.log(`  恢复模型失败：${error?.message ?? error}`);
       }
+      this.#assertUpstreamReady(
+        client,
+        '启动恢复期间上游意外退出，模型服务已断开。请重启服务。',
+      );
     } catch (error) {
+      if (error?.code === 'operation_cancelled') throw error;
       this.state.phase = 'error';
       this.state.error = error?.message ?? String(error);
+      this.state.errorCode = typeof error?.code === 'string' && error.code ? error.code : 'startup_failed';
+      this.state.port = null;
+      this.state.upstream = { ready: false, baseUrl: null };
       throw error;
     }
+  }
+
+  #handleUpstreamExit(client, detail = {}) {
+    if (
+      this.client !== client ||
+      this.#expectedClientExits.has(client) ||
+      !['ready', 'probing'].includes(this.state.phase)
+    ) return;
+    const code = detail?.code === null || detail?.code === undefined ? '' : `（退出码 ${detail.code}）`;
+    const signal = typeof detail?.signal === 'string' ? `（信号 ${detail.signal}）` : '';
+    this.state.phase = 'error';
+    this.state.errorCode = 'upstream_disconnected';
+    this.state.error = `上游服务意外退出${code}${signal}，模型服务已断开。请重启服务。`;
+    this.state.upstream = { ...this.state.upstream, ready: false };
+    this.log(this.state.error);
+  }
+
+  #assertUpstreamReady(client, fallbackMessage) {
+    if (this.#expectedClientExits.has(client) || this.client !== client) {
+      throw new BridgeError('当前服务操作已被主动停止或替换，启动或切换已取消。', 409, 'operation_cancelled');
+    }
+    if (client?.ready) return;
+    const message = this.state.errorCode === 'upstream_disconnected' && this.state.error
+      ? this.state.error
+      : fallbackMessage;
+    this.state.phase = 'error';
+    this.state.error = message;
+    this.state.errorCode = 'upstream_disconnected';
+    this.state.upstream = {
+      ...this.state.upstream,
+      ready: false,
+      baseUrl: client?.baseUrl ?? null,
+    };
+    throw new BridgeError(message, 502, 'upstream_disconnected');
   }
 
   /**
@@ -278,26 +340,39 @@ export class Bridge {
     }
 
     const settingsNow = await settings.readSettings();
+    const running = this.state.phase === 'ready' && Boolean(this.client?.ready);
     if (settingsNow.upstreamMode === mode) {
       this.state.mode = mode;
-      return { ok: true, mode, changed: false };
+      return { ok: true, mode, changed: false, requiresStart: !running };
     }
 
     const previousMode = this.state.mode;
     const previousClient = this.client;
-    const running = Boolean(previousClient?.ready);
 
     await settings.writeSettings({ upstreamMode: mode });
     this.state.mode = mode;
 
     // 没在跑：只落盘，下次启动按新方案起
-    if (!running) return { ok: true, mode, changed: true };
+    if (!running) {
+      this.state.models = [];
+      this.state.verdicts.clear();
+      this.state.upstream = { ready: false, baseUrl: null };
+      this.state.phase = 'idle';
+      this.state.error = null;
+      this.state.errorCode = null;
+      return { ok: true, mode, changed: true, requiresStart: true };
+    }
 
     // 热切换：先起新的，成了再停旧的；失败原地回滚
     let nextClient;
     try {
-      nextClient = this.#clientFactory(mode);
+      nextClient = this.#clientFactory(mode, {
+        onExit: (detail) => this.#handleUpstreamExit(nextClient, detail),
+      });
       await nextClient.start();
+      if (!nextClient.ready) {
+        throw new BridgeError('新上游启动后马上断开，切换没有完成。', 502, 'upstream_not_ready');
+      }
     } catch (error) {
       await nextClient?.stop().catch(() => {});
       await settings.writeSettings({ upstreamMode: previousMode });
@@ -311,7 +386,24 @@ export class Bridge {
     }
 
     this.client = nextClient;
-    await previousClient.stop().catch(() => {});
+    this.#expectedClientExits.add(previousClient);
+    try {
+      await previousClient.stop().catch(() => {});
+    } finally {
+      this.#expectedClientExits.delete(previousClient);
+    }
+    if (this.client !== nextClient || !nextClient.ready) {
+      this.state.models = [];
+      this.state.verdicts.clear();
+    }
+    this.#assertUpstreamReady(
+      nextClient,
+      '新上游在切换完成前意外退出，模型服务已断开。请重启服务。',
+    );
+    // 旧端可能在等待新端启动期间退出并写入错误；新端已就绪并完成接管时清掉旧故障。
+    this.state.phase = 'ready';
+    this.state.error = null;
+    this.state.errorCode = null;
     this.state.upstream = { ready: true, baseUrl: nextClient.baseUrl };
 
     // 判定按方案分开记：清掉旧的，从缓存按新方案的指纹恢复（不发请求、不花额度）
@@ -323,7 +415,15 @@ export class Bridge {
     } catch (error) {
       this.log(`方案已切换，但恢复模型清单失败：${error?.message ?? error}`);
     }
-    return { ok: true, mode, changed: true };
+    if (this.client !== nextClient || !nextClient.ready) {
+      this.state.models = [];
+      this.state.verdicts.clear();
+    }
+    this.#assertUpstreamReady(
+      nextClient,
+      '方案切换后恢复模型期间新上游意外退出，模型服务已断开。请重启服务。',
+    );
+    return { ok: true, mode, changed: true, requiresStart: false };
   }
 
   /**
@@ -491,12 +591,20 @@ export class Bridge {
       });
     }
     if (this.client) {
-      await this.client.stop();
-      this.client = null;
+      const client = this.client;
+      this.#expectedClientExits.add(client);
+      try {
+        await client.stop();
+      } finally {
+        this.#expectedClientExits.delete(client);
+        if (this.client === client) this.client = null;
+      }
     }
     this.state.port = null;
     this.state.upstream.ready = false;
     this.state.phase = 'idle';
+    this.state.error = null;
+    this.state.errorCode = null;
   }
 
   /**
@@ -622,6 +730,20 @@ export class Bridge {
     }
     this.activePromptCount += 1;
     return null;
+  }
+
+  #reserveAllProbe() {
+    if (this.probeAllInFlight || this.probeModelIds.size > 0) {
+      throw new BridgeError('已有模型检测正在进行，请等它完成后再试。', 409, 'probe_busy');
+    }
+    this.probeAllInFlight = true;
+  }
+
+  #reserveSingleProbe(modelId) {
+    if (this.probeAllInFlight || this.probeModelIds.has(modelId)) {
+      throw new BridgeError('这个模型或其他模型检测正在进行，请等它完成后再试。', 409, 'probe_busy');
+    }
+    this.probeModelIds.add(modelId);
   }
 
   #reserveRefresh() {
@@ -753,9 +875,12 @@ export class Bridge {
    * @param {number} [o.timeoutMs] 单个模型的超时，默认交给 probe.js
    */
   async probe({ force = false, limit, onlyFailed = false, timeoutMs } = {}) {
-    const waitForChange = this.#reservePrompt();
-    if (waitForChange) await waitForChange;
+    this.#reserveAllProbe();
+    let promptReserved = false;
     try {
+      const waitForChange = this.#reservePrompt();
+      if (waitForChange) await waitForChange;
+      promptReserved = true;
       const all = this.state.models.length ? this.state.models : await this.refresh();
       // 只重测失败的那批（自动重试路径）；正常路径测全部
       const pool = onlyFailed
@@ -790,10 +915,11 @@ export class Bridge {
         return results;
       } finally {
         this.state.progress = null;
-        this.state.phase = 'ready';
+        if (this.state.phase === 'probing') this.state.phase = 'ready';
       }
     } finally {
-      this.activePromptCount -= 1;
+      if (promptReserved) this.activePromptCount -= 1;
+      this.probeAllInFlight = false;
     }
   }
 
@@ -848,6 +974,9 @@ export class Bridge {
    */
   async listTargetStates() {
     const states = [];
+    const savedSelections = this.targets.some((target) => target.selectsModels === true)
+      ? (await settings.readSettings()).targetModels
+      : {};
     for (const target of this.targets) {
       let detected = false;
       let written = false;
@@ -869,6 +998,9 @@ export class Bridge {
         models,
         // 界面靠这个标记决定「写入」是直接写还是先让用户勾模型
         selectsModels: target.selectsModels === true,
+        ...(target.selectsModels === true
+          ? { selectedModelIds: Array.isArray(savedSelections?.[target.id]) ? [...savedSelections[target.id]] : null }
+          : {}),
       });
     }
     this.state.targets = states;
@@ -905,10 +1037,18 @@ export class Bridge {
       await settings.writeSettings({ targetModels: { ...saved, [target.id]: picked.map((model) => model.id) } });
       return picked;
     }
-    const remembered = (saved[target.id] ?? []).length
-      ? usable.filter((model) => saved[target.id].includes(model.id))
-      : [];
-    return remembered.length ? remembered : usable;
+    if (Object.hasOwn(saved, target.id)) {
+      const remembered = usable.filter((model) => saved[target.id].includes(model.id));
+      if (!remembered.length) {
+        throw new BridgeError(
+          '上次选择的模型现在都不可用，暂时不能写入。请重新检测模型，或回来改选其他可用模型。',
+          400,
+          'no_models_selected',
+        );
+      }
+      return remembered;
+    }
+    return usable;
   }
 
   /** 从指定目标里摘掉我们写入的配置 */
@@ -1291,6 +1431,18 @@ export class Bridge {
         'context_window_requires_model_action',
       );
     }
+    if (patch && Object.hasOwn(patch, 'probeConcurrency')) {
+      const value = patch.probeConcurrency;
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 6) {
+        throw new BridgeError('检测并发必须是 1 到 6 之间的整数。', 400, 'invalid_probe_concurrency');
+      }
+    }
+    if (patch && Object.hasOwn(patch, 'probeTtlMinutes')) {
+      const value = patch.probeTtlMinutes;
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        throw new BridgeError('判定有效期必须是有限的正数。', 400, 'invalid_probe_ttl');
+      }
+    }
     return settings.writeSettings(patch);
   }
 
@@ -1314,11 +1466,14 @@ export class Bridge {
    * 失败不抛，返回一个 verdict:'failed' 的结果——界面要显示原因，不是弹一个红框。
    */
   async probeOne(modelId) {
-    const waitForChange = this.#reservePrompt();
-    if (waitForChange) await waitForChange;
+    const model = this.state.models.find((m) => m.id === modelId);
+    if (!model) throw new BridgeError('找不到这个模型，可能目录刚刷新过。', 404, 'model_not_found');
+    this.#reserveSingleProbe(modelId);
+    let promptReserved = false;
     try {
-      const model = this.state.models.find((m) => m.id === modelId);
-      if (!model) throw new BridgeError('找不到这个模型，可能目录刚刷新过。', 404, 'model_not_found');
+      const waitForChange = this.#reservePrompt();
+      if (waitForChange) await waitForChange;
+      promptReserved = true;
       const [result] = await probeMany({
         client: this.client,
         models: [model],
@@ -1331,7 +1486,8 @@ export class Bridge {
       if (result) this.state.verdicts.set(modelId, result);
       return result ? this.#view(model) : null;
     } finally {
-      this.activePromptCount -= 1;
+      if (promptReserved) this.activePromptCount -= 1;
+      this.probeModelIds.delete(modelId);
     }
   }
 }

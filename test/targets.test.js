@@ -359,7 +359,7 @@ test('勾选目标：只写勾中的那几个，并且把选择记住', async (t
   const first = await bridge.installTarget('fake-pick', { modelIds: ['opencode/good-two'] });
   assert.equal(first.added, 1);
   assert.deepEqual(await bridge.installTarget('fake-pick').then(() => bridge.listTargetStates()), [
-    { id: 'fake-pick', label: '可勾选的目标', detected: true, written: true, models: ['opencode/good-two'], selectsModels: true },
+    { id: 'fake-pick', label: '可勾选的目标', detected: true, written: true, models: ['opencode/good-two'], selectsModels: true, selectedModelIds: ['opencode/good-two'] },
   ]);
 
   // 不传 modelIds（改密钥、改上下文之后的重写）应当沿用上次勾选，不偷偷扩大范围
@@ -380,6 +380,34 @@ test('勾选目标：一个都没勾中要报错；没勾过的目标写全部�
   bridge.targets = [{ ...bridge.targets[0], install: async (models) => { calls.push(models.map((m) => m.id)); return { changed: true, added: models.length }; } }];
   await bridge.installTarget('fake-pick');
   assert.deepEqual(calls[0], ['opencode/good-one', 'opencode/good-two']);
+});
+
+test('勾选目标快照：从未保存返回 null，保存后保留原选中 id', async (t) => {
+  const { bridge } = selectionBridge(t, []);
+  let target = (await bridge.listTargetStates()).find((item) => item.id === 'fake-pick');
+  assert.equal(target.selectedModelIds, null);
+
+  await bridge.installTarget('fake-pick', { modelIds: ['opencode/good-two'] });
+  bridge.state.verdicts.set('opencode/good-two', { verdict: 'failed', note: '暂时不可用' });
+  target = (await bridge.listTargetStates()).find((item) => item.id === 'fake-pick');
+  assert.deepEqual(target.selectedModelIds, ['opencode/good-two']);
+});
+
+test('勾选目标：上次所选模型全不可用时报错，不得扩大到其他模型', async (t) => {
+  const calls = [];
+  const { bridge } = selectionBridge(t, calls);
+  await bridge.installTarget('fake-pick', { modelIds: ['opencode/good-two'] });
+  bridge.state.verdicts.set('opencode/good-two', { verdict: 'failed', note: '暂时不可用' });
+  bridge.targets[0] = {
+    ...bridge.targets[0],
+    install: async (models) => { calls.push(...models.map((model) => model.id)); return { added: models.length }; },
+  };
+
+  await assert.rejects(
+    () => bridge.installTarget('fake-pick'),
+    (error) => error.code === 'no_models_selected' && /上次选择的模型.*不可用/.test(error.message),
+  );
+  assert.deepEqual(calls, ['opencode/good-two'], '失败重写不得追加新的模型');
 });
 
 test('不支持勾选的目标照旧写全部可用模型', async (t) => {

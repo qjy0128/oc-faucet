@@ -568,6 +568,29 @@ test('start：并发调用只起一次', async (t) => {
   assert.equal(isAlive(client.child.pid), true);
 });
 
+test('运行中的 OpenCode 意外退出时通过 onExit 通知调用方', async (t) => {
+  const exits = [];
+  const { client } = makeClient({ onExit: (detail) => exits.push(detail) });
+  t.after(() => client.stop());
+  await client.start();
+  const child = client.child;
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill('SIGTERM');
+  await exited;
+
+  assert.equal(client.ready, false);
+  assert.deepEqual(exits, [{ code: 0, signal: null }]);
+});
+
+test('主动 stop 不触发 OpenCode 意外退出回调', async (t) => {
+  const exits = [];
+  const { client } = makeClient({ onExit: (detail) => exits.push(detail) });
+  await client.start();
+  await client.stop();
+
+  assert.deepEqual(exits, []);
+});
+
 test('providers：上游报错时抛 upstream_error', async (t) => {
   const { client } = makeClient();
   t.after(() => client.stop());

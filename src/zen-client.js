@@ -71,6 +71,7 @@ function pause(ms, signal) {
  * @param {string} [o.baseUrl]     zen 根地址（默认 https://opencode.ai；测试注本地桩）
  * @param {string} [o.modelsDevUrl] 目录源（默认 models.dev；测试注本地桩）
  * @param {(line:string)=>void} [o.onLog]
+ * @param {(detail:{code:number|null,signal:string|null})=>void} [o.onExit] 侧车意外退出通知
  */
 export class ZenClient {
   constructor(o = {}) {
@@ -83,6 +84,7 @@ export class ZenClient {
     this.inferenceRoot = `${base}/inference`;
     this.openAiRoot = `${base}/inference/openai`;
     this.onLog = typeof o.onLog === 'function' ? o.onLog : () => {};
+    this.onExit = typeof o.onExit === 'function' ? o.onExit : () => {};
 
     this.#started = false;
     /** modelID → 方言（'chat' | 'anthropic' | 'responses'），providers() 时刷新 */
@@ -104,6 +106,15 @@ export class ZenClient {
   #transport;
   #bunPath;
   #sidecarPath;
+
+  #handleSidecarExit(detail) {
+    this.#started = false;
+    try {
+      this.onExit(detail);
+    } catch {
+      // 调用方的状态回调不能影响伪装上游收尾
+    }
+  }
 
   /** 与 OcClient 同名属性对齐：伪装模式没有隔离子进程，这个值让上下文覆盖功能整体关闭 */
   get isolate() {
@@ -127,6 +138,7 @@ export class ZenClient {
         bunPath: this.#bunPath,
         sidecarPath: this.#sidecarPath,
         log: (line) => this._log(line),
+        onExit: (detail) => this.#handleSidecarExit(detail),
       });
       await this.#transport.start();
       this.#fetchImpl = (url, init) => this.#transport.fetch(url, init);
