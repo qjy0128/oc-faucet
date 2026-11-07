@@ -10,8 +10,8 @@
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| macOS（Apple Silicon） | `OC.Faucet-1.0.3-arm64.dmg` | 打开拖进「应用程序」 |
-| Windows（64 位） | `OC.Faucet.Setup.1.0.3.exe` | 双击安装 |
+| macOS（Apple Silicon） | `OC.Faucet-1.0.4-arm64.dmg` | 打开拖进「应用程序」 |
+| Windows（64 位） | `OC.Faucet.Setup.1.0.4.exe` | 双击安装 |
 
 也可以从源码跑（需要 Node.js ≥ 22 和本机装有 [OpenCode](https://opencode.ai)）。内嵌模式支持 OpenCode 1.x 和 2.x，启动时会自动识别主版本并选择对应的启动参数与 API：
 
@@ -20,6 +20,10 @@ npm install
 npm run desktop   # 桌面面板
 npm start         # 或只跑后台服务
 ```
+
+## 自动更新
+
+桌面应用每次启动会到 GitHub 检查有没有新版本（每 24 小时最多自动检查一次）；发现新版会弹窗询问，确认后自动下载安装包到系统的「下载」文件夹并启动安装，macOS 按 DMG 提示拖装、Windows 按安装向导走完即可，安装前不需要先退出旧版本。安装包会校验 GitHub 提供的大小与 SHA-256 后才落盘。也可以在「说明与设置」里点**检查更新**手动查（手动检查不受 24 小时限制）。安装包未做代码签名，首次打开时系统可能提示「无法验证开发者」，到「系统设置 → 隐私与安全性」里允许即可。
 
 ## 使用方式
 

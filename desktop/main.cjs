@@ -12,6 +12,7 @@
  */
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, shell } = require('electron');
 const path = require('node:path');
+const { createUpdater } = require('./updater.cjs');
 
 /** 允许的 IPC 通道。只有这些会被接。 */
 const IPC_CHANNELS = [
@@ -35,12 +36,21 @@ const IPC_CHANNELS = [
   'oc:open-log',
   'oc:restart',
   'oc:stop',
+  // 应用更新（检查/下载/安装都在主进程，界面只收状态和按固定按钮）
+  'oc:update-state',
+  'oc:check-update',
+  'oc:download-update',
+  'oc:cancel-update',
+  'oc:open-release-page',
+  'oc:show-downloaded-file',
 ];
 
 let win = null;
 let tray = null;
 let bridge = null;
+let updater = null;
 let quitting = false;
+let autoUpdateChecked = false;
 
 /** 动态 import ESM 的编排层（主进程是 CJS，桥是 ESM） */
 async function loadBridge() {
@@ -122,6 +132,35 @@ function pushState() {
   if (!win || win.isDestroyed()) return;
   try {
     win.webContents.send('oc:state', bridge.snapshot());
+  } catch {
+    /* 窗口可能正好在关 */
+  }
+}
+
+/** 组装更新器：版本比较、24 小时节流、下载校验、启动安装器都在这里面做 */
+function setupUpdater() {
+  updater = createUpdater({
+    currentVersion: app.getVersion(),
+    stateFile: path.join(app.getPath('userData'), 'update-state.json'),
+    downloadDir: app.getPath('downloads'),
+    openPath: (file) => shell.openPath(file),
+    onState: pushUpdateState,
+  });
+}
+
+let lastUpdatePushAt = 0;
+let lastUpdateStatus = null;
+
+/** 下载进度的推送会一截一截地来：非终态在 150ms 内只发一帧，终态永远直达 */
+function pushUpdateState(state) {
+  if (!win || win.isDestroyed()) return;
+  const now = Date.now();
+  const terminal = ['available', 'ready', 'error'].includes(state.status);
+  if (!terminal && state.status === lastUpdateStatus && now - lastUpdatePushAt < 150) return;
+  lastUpdateStatus = state.status;
+  lastUpdatePushAt = now;
+  try {
+    win.webContents.send('oc:update-state', state);
   } catch {
     /* 窗口可能正好在关 */
   }
@@ -253,13 +292,50 @@ function registerIpc() {
     pushState();
     return bridge.snapshot();
   });
+
+  // —— 应用更新：界面只能查询、点按钮，不能指定任何 URL 或路径 ——
+
+  ipcMain.handle('oc:update-state', () => updater.getState());
+
+  // 手动检查绕过 24 小时节流；失败把中文原因抛给界面（preload 会剥 IPC 的壳）
+  ipcMain.handle('oc:check-update', async () => {
+    await updater.checkForUpdates({ manual: true });
+    return updater.getState();
+  });
+
+  ipcMain.handle('oc:download-update', () => updater.downloadAndOpen());
+
+  ipcMain.handle('oc:cancel-update', () => updater.cancelDownload());
+
+  // 打开发布页 / 定位已下载的安装包：地址和路径都来自主进程刚查到的状态，界面传不了
+  ipcMain.handle('oc:open-release-page', () => {
+    const { releaseUrl } = updater.getState();
+    if (releaseUrl) shell.openExternal(releaseUrl);
+    return { opened: Boolean(releaseUrl) };
+  });
+
+  ipcMain.handle('oc:show-downloaded-file', () => {
+    const { filePath } = updater.getState();
+    if (filePath) shell.showItemInFolder(filePath);
+    return { file: filePath ?? null };
+  });
 }
 
 app.whenReady().then(async () => {
   setDockIcon();
+  setupUpdater();
   createWindow();
   createTray();
   registerIpc();
+
+  // 首次窗口加载完成后查一轮更新（24 小时内只自动查一次）；失败只记日志，不打扰启动
+  win.webContents.on('did-finish-load', () => {
+    if (autoUpdateChecked) return;
+    autoUpdateChecked = true;
+    updater
+      .checkForUpdates()
+      .catch((error) => console.error('[oc] 自动检查更新失败：', error.message));
+  });
 
   try {
     bridge = await loadBridge();
@@ -292,6 +368,7 @@ app.on('before-quit', async (event) => {
   if (quitting) return;
   quitting = true;
   event.preventDefault();
+  updater?.cancelDownload();
   try {
     await bridge?.stop({ uninstall: true });
   } catch (error) {

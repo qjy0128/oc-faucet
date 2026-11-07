@@ -1,6 +1,6 @@
 {
   "name": "oc-faucet",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "type": "module",
   "description": "OC Faucet — 把 OpenCode 免费模型接入十种 AI 编程工具：模型体检、协议翻译、信封约束、一键接入，内嵌与伪装双上游",
@@ -60,9 +60,18 @@
       "icon": "desktop/build/icon.icns",
       "category": "public.app-category.developer-tools",
       "extraResources": [
-        { "from": "desktop/build/bun/darwin-arm64/bun", "to": "bun/bun" },
-        { "from": "src/zen-bun-sidecar.js", "to": "bun/zen-bun-sidecar.js" },
-        { "from": "legal/Bun-LICENSE.md", "to": "bun/LICENSE-Bun.md" }
+        {
+          "from": "desktop/build/bun/darwin-arm64/bun",
+          "to": "bun/bun"
+        },
+        {
+          "from": "src/zen-bun-sidecar.js",
+          "to": "bun/zen-bun-sidecar.js"
+        },
+        {
+          "from": "legal/Bun-LICENSE.md",
+          "to": "bun/LICENSE-Bun.md"
+        }
       ],
       "target": [
         {
@@ -76,9 +85,18 @@
     "win": {
       "icon": "desktop/build/icon.ico",
       "extraResources": [
-        { "from": "desktop/build/bun/win32-x64/bun.exe", "to": "bun/bun.exe" },
-        { "from": "src/zen-bun-sidecar.js", "to": "bun/zen-bun-sidecar.js" },
-        { "from": "legal/Bun-LICENSE.md", "to": "bun/LICENSE-Bun.md" }
+        {
+          "from": "desktop/build/bun/win32-x64/bun.exe",
+          "to": "bun/bun.exe"
+        },
+        {
+          "from": "src/zen-bun-sidecar.js",
+          "to": "bun/zen-bun-sidecar.js"
+        },
+        {
+          "from": "legal/Bun-LICENSE.md",
+          "to": "bun/LICENSE-Bun.md"
+        }
       ],
       "target": [
         {
@@ -93,5 +111,8 @@
       "oneClick": true,
       "perMachine": false
     }
+  },
+  "dependencies": {
+    "semver": "^7.8.6"
   }
 }

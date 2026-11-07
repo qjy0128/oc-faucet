@@ -5,6 +5,8 @@ import { readFileSync } from 'node:fs';
 const renderer = readFileSync(new URL('../desktop/renderer.js', import.meta.url), 'utf8');
 const index = readFileSync(new URL('../desktop/index.html', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../desktop/style.css', import.meta.url), 'utf8');
+const main = readFileSync(new URL('../desktop/main.cjs', import.meta.url), 'utf8');
+const preload = readFileSync(new URL('../desktop/preload.cjs', import.meta.url), 'utf8');
 
 function declarations(selector, source = css) {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -47,4 +49,47 @@ test('状态栏允许整组换行，地址、密钥、方案和按钮不会被�
   const narrow = css.match(/@media\s*\(max-width:\s*1200px\)\s*\{([\s\S]*?)\n\}/);
   assert.ok(narrow, '默认窗口宽度下要有状态栏响应式规则');
   assert.match(declarations('.statusbar .lead', narrow[1]), /flex-basis:\s*100%/);
+});
+
+test('应用更新的 IPC 通道全部登记在白名单里，preload 不让界面传 URL 或路径', () => {
+  const channels = [
+    'oc:update-state',
+    'oc:check-update',
+    'oc:download-update',
+    'oc:cancel-update',
+    'oc:open-release-page',
+    'oc:show-downloaded-file',
+  ];
+  for (const channel of channels) {
+    assert.ok(main.includes(`'${channel}'`), `主进程缺少通道：${channel}`);
+    assert.ok(main.includes(`ipcMain.handle('${channel}'`), `通道没有注册处理器：${channel}`);
+  }
+  // 发布页与文件定位只由主进程自己取状态里的地址/路径，界面侧两个接口不接收参数
+  assert.match(main, /const \{ releaseUrl \} = updater\.getState\(\)/);
+  assert.match(main, /const \{ filePath \} = updater\.getState\(\)/);
+  assert.match(preload, /openReleasePage: \(\) =>/);
+  assert.match(preload, /showDownloadedFile: \(\) =>/);
+});
+
+test('更新弹窗有确认、取消、重试、发布说明与定位文件入口，下载有进度条', () => {
+  for (const id of ['update-dialog', 'update-title', 'update-lead', 'update-notes', 'update-progress', 'update-error']) {
+    assert.ok(index.includes(`id="${id}"`), `缺少元素：${id}`);
+  }
+  for (const id of ['update-later', 'update-confirm', 'update-cancel', 'update-retry', 'update-open-notes', 'update-show-file']) {
+    assert.ok(index.includes(`id="${id}"`), `缺少按钮：${id}`);
+  }
+  assert.match(renderer, /openUpdateDialog\(\)/);
+  assert.match(renderer, /closeUpdateDialog\(\)/);
+  assert.match(declarations('.update-progress-bar span'), /width:\s*0%/);
+  assert.match(css, /\.update-error\s*\{[^}]*--bad|color:\s*var\(--bad\)/);
+});
+
+test('设置区有版本号与手动检查入口，Web 壳不带更新接口时入口保持隐藏', () => {
+  assert.ok(index.includes('id="app-version"'));
+  assert.ok(index.includes('id="act-check-update"'));
+  // 两个入口默认 hidden，由渲染进程检测到桌面接口后再亮出来
+  assert.match(index, /id="app-version" class="hint" hidden/);
+  assert.match(index, /id="act-check-update" class="mini" type="button" hidden/);
+  assert.match(renderer, /const updateSupported = typeof window\.oc\.getUpdateState === 'function';/);
+  assert.match(renderer, /if \(!updateSupported\) return;/);
 });

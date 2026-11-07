@@ -54,4 +54,17 @@ contextBridge.exposeInMainWorld('oc', {
   openLog: () => ipcRenderer.invoke('oc:open-log'),
   restart: () => ipcRenderer.invoke('oc:restart'),
   stop: () => ipcRenderer.invoke('oc:stop'),
+  // —— 应用更新（桌面壳才有；界面只能查询和按固定按钮，传不了 URL/路径） ——
+  /** 订阅更新状态推送；返回取消订阅函数 */
+  onUpdateState(callback) {
+    const handler = (_event, state) => callback(state);
+    ipcRenderer.on('oc:update-state', handler);
+    return () => ipcRenderer.removeListener('oc:update-state', handler);
+  },
+  getUpdateState: () => ipcRenderer.invoke('oc:update-state'),
+  checkForUpdates: () => invokeClean('oc:check-update'),
+  downloadUpdate: () => invokeClean('oc:download-update'),
+  cancelUpdate: () => ipcRenderer.invoke('oc:cancel-update'),
+  openReleasePage: () => ipcRenderer.invoke('oc:open-release-page'),
+  showDownloadedFile: () => ipcRenderer.invoke('oc:show-downloaded-file'),
 });

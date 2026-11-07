@@ -122,6 +122,17 @@ function humanAgo(ts) {
   return `${Math.round(gap / 86_400_000)} 天前`;
 }
 
+/** 原生 <dialog> 的开关要给老环境留兜底（局域网弹窗和更新弹窗共用） */
+function openModal(dialog) {
+  if (typeof dialog.showModal === 'function') dialog.showModal();
+  else dialog.setAttribute('open', '');
+}
+
+function closeModal(dialog) {
+  if (typeof dialog.close === 'function') dialog.close();
+  else dialog.removeAttribute('open');
+}
+
 /** 耗时列：这次真测过就给耗时，只是从缓存恢复就给判定时间 */
 function timingText(model) {
   if (verdictKey(model) === 'wait') return '—';
@@ -1351,9 +1362,7 @@ async function showLanConfig() {
     models.append(h('span', 'hint', ` 等共 ${info.modelIds.length} 个（其余见模型清单）`));
   }
 
-  const dialog = byId('lan-dialog');
-  if (typeof dialog.showModal === 'function') dialog.showModal();
-  else dialog.setAttribute('open', '');
+  openModal(byId('lan-dialog'));
 }
 
 /** 重启服务：只重启转发口和 OpenCode，控制面板不关；各接入工具的配置不动 */
@@ -1470,6 +1479,213 @@ async function saveSettings() {
 }
 
 /* ------------------------------------------------------------------ */
+/* 应用更新（桌面壳专属；Web 壳没有这组接口，相关入口一开始就是藏着的）  */
+/* ------------------------------------------------------------------ */
+
+const updateSupported = typeof window.oc.getUpdateState === 'function';
+let updateState = null;
+/** 上一帧更新状态：用来分辨「新发现新版」和「取消下载/检查失败退回确认态」 */
+let lastUpdateUiStatus = null;
+
+function humanBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${unit === 0 || value >= 100 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+
+function openUpdateDialog() {
+  openModal(byId('update-dialog'));
+}
+
+function closeUpdateDialog() {
+  closeModal(byId('update-dialog'));
+}
+
+/** 按主进程推来的更新状态重画弹窗。自动弹出的时机：发现新版、下载结束（无论成败）。 */
+function renderUpdateDialog(state) {
+  const dialog = byId('update-dialog');
+  const title = byId('update-title');
+  const lead = byId('update-lead');
+  const notesBox = byId('update-notes-box');
+  const notes = byId('update-notes');
+  const progress = byId('update-progress');
+  const fill = byId('update-progress-fill');
+  const progressText = byId('update-progress-text');
+  const error = byId('update-error');
+  const later = byId('update-later');
+  const confirm = byId('update-confirm');
+  const cancel = byId('update-cancel');
+  const retry = byId('update-retry');
+  const openNotes = byId('update-open-notes');
+  const showFile = byId('update-show-file');
+
+  const show = (node, visible) => {
+    node.hidden = !visible;
+  };
+
+  const previous = lastUpdateUiStatus;
+  lastUpdateUiStatus = state.status;
+
+  if (state.status === 'available') {
+    title.textContent = '发现新版本';
+    lead.textContent = `当前 ${state.currentVersion} → 新版 ${state.latestVersion}。点「立即更新」会把安装包下载到系统的「下载」文件夹（${state.assetName}），下好后自动启动安装。`;
+    notes.textContent = state.releaseNotes?.trim() || '（这次发布没有写更新说明）';
+    show(notesBox, true);
+    show(progress, false);
+    show(error, false);
+    show(later, true);
+    show(openNotes, true);
+    show(showFile, false);
+    show(retry, false);
+    show(cancel, false);
+    confirm.disabled = false;
+    show(confirm, true);
+    // 真正新发现时才自动弹；取消下载、检查失败退回确认态时不追着用户弹
+    if (!dialog.open && previous !== 'downloading' && previous !== 'available') openUpdateDialog();
+    return;
+  }
+
+  // 下载中 / 下载结束：只更新已经打开的弹窗，不追着用户弹
+  if (state.status === 'downloading') {
+    const total = state.totalBytes;
+    const done = humanBytes(state.downloadedBytes);
+    const percent = total > 0 ? Math.min(100, Math.round((state.downloadedBytes / total) * 100)) : null;
+    fill.style.width = percent === null ? '100%' : `${percent}%`;
+    progressText.textContent = percent === null
+      ? `正在下载… ${done}`
+      : `正在下载… ${percent}%（${done} / ${humanBytes(total)}）`;
+    title.textContent = '正在下载新版本';
+    lead.textContent = `新版 ${state.latestVersion} 下载到「下载」文件夹，完成后自动启动安装。`;
+    show(notesBox, false);
+    show(progress, true);
+    show(error, false);
+    show(later, false);
+    show(openNotes, false);
+    show(showFile, false);
+    show(retry, false);
+    show(cancel, true);
+    show(confirm, false);
+    return;
+  }
+
+  if (state.status === 'ready') {
+    title.textContent = state.launched ? '安装包已启动' : '安装包已就绪';
+    lead.textContent = state.launched
+      ? `新版 ${state.latestVersion} 的安装包已放入「下载」文件夹并尝试启动安装。按系统提示完成安装即可，本应用不需要先退出。`
+      : `新版 ${state.latestVersion} 的安装包已放入「下载」文件夹，但系统没有自动打开它。可以点下面按钮定位文件，双击手动安装。`;
+    show(notesBox, false);
+    show(progress, false);
+    show(error, false);
+    show(later, true);
+    later.textContent = '关闭';
+    show(openNotes, false);
+    show(showFile, true);
+    show(retry, false);
+    show(cancel, false);
+    show(confirm, false);
+    openUpdateDialog();
+    return;
+  }
+
+  if (state.status === 'error') {
+    title.textContent = '下载失败';
+    lead.textContent = `新版 ${state.latestVersion} 没有下载成功，网络恢复后可以重试，或直接去发布页手动下载。`;
+    error.textContent = state.error ?? '';
+    show(notesBox, false);
+    show(progress, false);
+    show(error, Boolean(state.error));
+    show(later, true);
+    later.textContent = '关闭';
+    show(openNotes, true);
+    show(showFile, false);
+    show(retry, true);
+    show(cancel, false);
+    show(confirm, false);
+    openUpdateDialog();
+    return;
+  }
+
+  // 其它状态（空闲 / 检查中 / 已最新）：弹窗若还开着就收掉
+  if (dialog.open) {
+    later.textContent = '稍后再说';
+    closeUpdateDialog();
+  }
+}
+
+function receiveUpdateState(state) {
+  if (!state || typeof state !== 'object') return;
+  updateState = state;
+  const version = byId('app-version');
+  if (state.currentVersion) version.textContent = `版本 ${state.currentVersion}`;
+  renderUpdateDialog(state);
+}
+
+async function startUpdateDownload() {
+  byId('update-confirm').disabled = true;
+  await call('下载更新', () => window.oc.downloadUpdate(), beginAction('update:download'));
+  // 结果经 oc:update-state 推送回来重画弹窗；这里不用再处理
+}
+
+async function checkForUpdates() {
+  const button = byId('act-check-update');
+  button.disabled = true;
+  const action = beginAction('update:check');
+  try {
+    const state = await call('检查更新', () => window.oc.checkForUpdates(), action);
+    if (!state) return;
+    if (state.status === 'up-to-date') note(`已是最新版本（${state.currentVersion}）`, 'ok', action);
+    // 发现新版本时弹窗会由状态推送自动打开，这里不重复提示
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function wireUpdate() {
+  byId('update-later').addEventListener('click', () => {
+    byId('update-later').textContent = '稍后再说';
+    closeUpdateDialog();
+  });
+  byId('update-confirm').addEventListener('click', startUpdateDownload);
+  byId('update-cancel').addEventListener('click', () => {
+    window.oc.cancelUpdate();
+  });
+  byId('update-retry').addEventListener('click', () => {
+    window.oc.downloadUpdate().catch(() => {});
+  });
+  byId('update-open-notes').addEventListener('click', () => {
+    window.oc.openReleasePage().catch(() => {});
+  });
+  byId('update-show-file').addEventListener('click', () => {
+    window.oc.showDownloadedFile().catch(() => {});
+  });
+  byId('update-dialog').addEventListener('cancel', (event) => {
+    // Esc / 点击背景关闭弹窗：下载不被打断，状态推送来了会照常更新
+    event.preventDefault();
+    byId('update-later').textContent = '稍后再说';
+    closeUpdateDialog();
+  });
+  byId('act-check-update').addEventListener('click', checkForUpdates);
+}
+
+function initUpdate() {
+  if (!updateSupported) return;
+  byId('app-version').hidden = false;
+  byId('act-check-update').hidden = false;
+  wireUpdate();
+  window.oc.onUpdateState(receiveUpdateState);
+  window.oc
+    .getUpdateState()
+    .then((state) => receiveUpdateState(state))
+    .catch(() => {});
+}
+
+/* ------------------------------------------------------------------ */
 /* 启动                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1485,11 +1701,7 @@ function wire() {
   byId('mode-masquerade').addEventListener('click', () => switchUpstreamMode('masquerade'));
   byId('act-lan').addEventListener('click', toggleLanAccess);
   byId('act-lan-info').addEventListener('click', showLanConfig);
-  byId('lan-close').addEventListener('click', () => {
-    const dialog = byId('lan-dialog');
-    if (typeof dialog.close === 'function') dialog.close();
-    else dialog.removeAttribute('open');
-  });
+  byId('lan-close').addEventListener('click', () => closeModal(byId('lan-dialog')));
   byId('cfg-save').addEventListener('click', saveSettings);
 
   // 状态栏的 BaseURL 复制；转发口没起来时按钮是灰的，走不到这里
@@ -1529,6 +1741,7 @@ function wire() {
 function start() {
   initTheme();
   wire();
+  initUpdate();
   renderKey(); // 密钥还没拉到：先画打码态，按钮置灰
 
   window.oc.onState(receiveSnapshot, handleWebConnectionError);
