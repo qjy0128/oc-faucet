@@ -1001,14 +1001,14 @@ function renderOpencodeBanner() {
       banner.hidden = true;
       return;
     }
-    banner.className = 'opencode-banner is-warning';
+    banner.className = 'opencode-banner is-info';
     banner.hidden = false;
-    title.textContent = '已安装 OpenCode，但外部 OpenCode 客户端当前未打开';
+    title.textContent = '已安装 OpenCode（外部未打开，不影响正常测模与转发）';
     desc.textContent = snapshot.mode === 'masquerade'
-      ? '本机已安装 OpenCode，但当前未检测到外部 OpenCode 客户端在运行（伪装方案可直接转发）。如需对照使用或检查登录状态，可先打开 OpenCode 再点「重新检测」。'
+      ? '当前使用「伪装」方案，内置 Bun 侧车可直接转发，无需打开外部 OpenCode（CLI 命令行与桌面版均可）。仅在登录/刷新账号或对照排查时再启动。'
       : isServiceReadySnapshot(snapshot)
-        ? 'OC Faucet 内部隔离实例已就绪，但当前未检测到外部 OpenCode 客户端处于打开状态；建议启动一次 OpenCode 客户端后再点「重新检测」。'
-        : '本机已安装 OpenCode，但外部 OpenCode 客户端尚未打开，且当前内置服务还未就绪；可打开 OpenCode 或等待服务就绪。';
+        ? '内嵌方案会在后台自动运行独立隔离的 OpenCode 子进程，不打开外部 OpenCode（CLI 命令行与桌面版均可）也能正常测模与转发。仅在登录/刷新账号（配合「复用本机 OpenCode 登录态」）或人工对照排查时需要外部打开。'
+        : '日常测模与转发由后台自动拉起的隔离进程完成，无需提前打开外部 OpenCode（CLI 命令行与桌面版均可）。仅在登录/刷新账号或人工对照排查时需要外部打开。';
     installBtn.hidden = true;
     switchBtn.hidden = true;
     dismissBtn.hidden = false;
@@ -1614,7 +1614,7 @@ async function checkOpencodeNow() {
     } else if (snapshot.errorCode === 'runtime_missing') {
       note('已检测到本机 OpenCode 安装，点下方「重试服务」即可启动。', 'ok', action);
     } else {
-      note('已检测到 OpenCode 安装，但外部 OpenCode 客户端尚未打开。', 'ok', action);
+      note('已检测到本机 OpenCode（CLI 命令行与桌面版均可）。当前外部未打开，日常测模与转发由后台隔离实例或侧车完成，仅登录账号或对照排查时需打开。', 'ok', action);
     }
     return status;
   } finally {

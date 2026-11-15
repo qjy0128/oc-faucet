@@ -78,6 +78,7 @@ function setDockIcon() {
 }
 
 function createWindow() {
+  const hideWindowMenu = process.platform !== 'darwin';
   win = new BrowserWindow({
     width: 1040,
     height: 700,
@@ -85,6 +86,7 @@ function createWindow() {
     minHeight: 560,
     title: 'OC Faucet',
     backgroundColor: '#0f1115',
+    autoHideMenuBar: hideWindowMenu,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -92,6 +94,11 @@ function createWindow() {
       sandbox: true,
     },
   });
+  // Windows / Linux 不显示 Electron 默认的 File/Edit/View/Window 窗口内菜单栏；macOS 保留顶部系统菜单以支持复制粘贴等快捷键
+  if (hideWindowMenu) {
+    win.setMenuBarVisibility(false);
+    win.removeMenu();
+  }
   win.loadFile(path.join(__dirname, 'index.html'));
   win.on('close', (event) => {
     // 关窗口 ≠ 退出：继续在托盘里跑，否则已接入工具里的模型会断。
@@ -345,6 +352,9 @@ function registerIpc() {
 }
 
 app.whenReady().then(async () => {
+  if (process.platform !== 'darwin') {
+    Menu.setApplicationMenu(null);
+  }
   setDockIcon();
   setupUpdater();
   createWindow();

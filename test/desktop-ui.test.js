@@ -115,8 +115,17 @@ test('桌面端含模型屏蔽隐藏栏、报错关闭按钮与 OpenCode 环境�
   }
   assert.match(declarations('.row-main'), /64px/);
   assert.match(css, /\.opencode-banner\s*\{/);
+  assert.match(css, /\.opencode-banner\.is-info\s*\{/);
   assert.match(css, /\.hidden-section\s*\{/);
   assert.match(preload, /setModelBlocked:/);
   assert.match(preload, /checkOpencodeEnv:/);
   assert.match(preload, /openOpencodeInstall:/);
+});
+
+test('Windows / Linux 隐藏并移除默认窗口菜单栏，macOS 保留全局应用菜单', () => {
+  assert.match(main, /process\.platform\s*!==\s*'darwin'/);
+  assert.match(main, /autoHideMenuBar:\s*hideWindowMenu/);
+  assert.match(main, /win\.setMenuBarVisibility\(false\)/);
+  assert.match(main, /win\.removeMenu\(\)/);
+  assert.match(main, /Menu\.setApplicationMenu\(null\)/);
 });

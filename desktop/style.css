@@ -1719,6 +1719,16 @@ code {
   color: var(--warn);
 }
 
+.opencode-banner.is-info {
+  border-color: var(--line-strong);
+  background: var(--card-2);
+  color: var(--ink-soft);
+}
+
+.opencode-banner.is-info strong {
+  color: var(--ink);
+}
+
 .opencode-banner-body {
   min-width: 0;
   flex: 1 1 auto;

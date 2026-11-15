@@ -502,8 +502,11 @@ test('启动 OpenCode 环境提示：未安装时顶部横幅与一次性弹窗�
   app.setState(closedState);
   app.api.receiveSnapshot(structuredClone(closedState));
   assert.equal(banner.hidden, false);
-  assert.equal(banner.classList.contains('is-warning'), true);
+  assert.equal(banner.classList.contains('is-info'), true);
+  assert.equal(banner.classList.contains('is-warning'), false);
   assert.match(app.document.getElementById('opencode-banner-title').textContent, /已安装.*未打开/);
+  assert.match(app.document.getElementById('opencode-banner-desc').textContent, /CLI.*桌面版均可/);
+  assert.match(app.document.getElementById('opencode-banner-desc').textContent, /无需.*打开外部 OpenCode|不打开外部 OpenCode/);
 
   // 点击重新检测调用后端
   await app.document.getElementById('opencode-banner-retry').dispatch('click')[0];
