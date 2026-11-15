@@ -19,15 +19,19 @@ import { homedir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import net from 'node:net';
 import { BridgeError } from './errors.js';
+import { classifyUpstreamError, extractRetryAfterMsFromBody } from './cooldown.js';
+import { syncIsolatedOpencodeAuth } from './opencode-auth.js';
 import { handoffInput, rejectFeedback } from './handoff.js';
 import { permissionPayload, promptPayload, providersPayload } from './oc-v2.js';
 import {
   basicAuthHeader,
   buildIsolatedEnv,
+  clearSessionSystemPrompt,
   ensureRuntimeDirs,
   isolatedConfig,
   randomPassword,
   runtimeRoot,
+  writeSessionSystemPrompt,
   ISOLATED_AGENT,
 } from './oc-isolation.js';
 
@@ -123,6 +127,11 @@ const PORT_PATTERNS = [
   /https?:\/\/127\.0\.0\.1:(\d{2,5})/,
   /port[^0-9]{0,12}(\d{2,5})/i,
 ];
+
+/** 给需要直接检测安装位置的模块暴露一份入口（保持 discoverOpencode 自身内部声明形式不变）。 */
+export function findOpencodeExecutable(explicit, pathEnv = process.env.PATH ?? '', home = homedir()) {
+  return discoverOpencode(explicit, pathEnv, home);
+}
 
 /**
  * 按契约顺序找出 opencode 可执行文件。
@@ -236,6 +245,24 @@ function describeErrorBody(body) {
   }
 }
 
+/** 从 OpenCode v1/v2 错误结构提取 status、code、response.body 与 retryAfterMs */
+function extractStructuredErrorMeta(errObj) {
+  if (!errObj || typeof errObj !== 'object') return {};
+  const data = errObj.data && typeof errObj.data === 'object' ? errObj.data : {};
+  const rawStatus = errObj.status ?? data.statusCode ?? errObj.statusCode;
+  const status = rawStatus !== undefined && rawStatus !== null && Number.isFinite(Number(rawStatus))
+    ? Number(rawStatus)
+    : null;
+  const code = typeof errObj.type === 'string'
+    ? errObj.type
+    : (typeof errObj.name === 'string' ? errObj.name : '');
+  const responseBody = typeof errObj.response?.body === 'string'
+    ? errObj.response.body
+    : (typeof data.responseBody === 'string' ? data.responseBody : '');
+  const retryAfterMs = extractRetryAfterMsFromBody(errObj) ?? extractRetryAfterMsFromBody(responseBody);
+  return { status, code, retryAfterMs, responseBody };
+}
+
 /** 把 AbortSignal 拼起来：任一触发就都触发 */
 function mergeSignals(timeoutMs, signal) {
   const timer = AbortSignal.timeout(timeoutMs);
@@ -285,7 +312,7 @@ async function request(url, { method = 'GET', body, timeoutMs = 30_000, signal, 
         parsed = null;
       }
     }
-    return { status: res.status, ok: res.ok, text, json: parsed };
+    return { status: res.status, ok: res.ok, headers: res.headers, text, json: parsed };
   } catch (error) {
     const abortedByCaller = Boolean(signal?.aborted);
     const reason = merged.timeoutSignal?.aborted && !abortedByCaller ? 'timeout' : 'aborted';
@@ -340,6 +367,7 @@ export class OcClient {
     this.requestedPort = Number.isInteger(o.port) && o.port >= 0 ? o.port : 0;
     // 隔离模式下 OpenCode 跑在自己的目录里；OCF_ISOLATE=0 只给排障使用，显式参数优先。
     this.isolate = typeof o.isolate === 'boolean' ? o.isolate : process.env.OCF_ISOLATE !== '0';
+    this.shareOpencodeAuth = o.shareOpencodeAuth === true;
     this.runtimeRoot = runtimeRoot(o.dataDir);
     this.serverPassword = this.isolate ? randomPassword() : null;
     this.serverUsername = 'opencode';
@@ -355,6 +383,7 @@ export class OcClient {
     // 直接调用 HTTP 方法的旧测试/排障代码默认走 v1；start() 会按真实二进制覆盖
     this.apiMajor = 1;
     this._latestToolCalls = new Map();
+    this._pendingPermissions = new Map();
 
     /** 正在进行的 start()，用来让并发调用共享同一次启动 */
     this._starting = null;
@@ -493,16 +522,22 @@ export class OcClient {
     const controller = new AbortController();
     this._eventAbort = controller;
     let opened;
+    let settledReady = false;
     this._eventReady = new Promise((resolve) => {
-      opened = resolve;
-      // 事件流只是 handoff 的保险丝，连不上不能反过来把 prompt 永久挂住
-      setTimeout(() => resolve(false), 2_000).unref?.();
+      opened = (value) => {
+        if (settledReady) return;
+        settledReady = true;
+        resolve(value);
+      };
+      // 事件流只是 handoff/权限兜底的保险丝，连不上不能反过来把 prompt 永久挂住
+      setTimeout(() => opened(false), 2_000).unref?.();
     });
     (async () => {
       while (!controller.signal.aborted) {
         try {
           await this._streamEvents(controller.signal, () => opened(true));
         } catch (error) {
+          opened(false);
           if (!controller.signal.aborted) {
             this._log(`[OC Faucet] 事件流断开，稍后重连：${error?.message ?? error}`);
           }
@@ -572,27 +607,38 @@ export class OcClient {
   _handleEvent(wrapper) {
     const event = wrapper?.payload ?? wrapper;
     if (this.apiMajor >= 2) {
-      if (event?.type === 'session.tool.input.started' && event.id) {
-        this._toolParts.set(event.id, { sessionID: event.sessionID, tool: event.name ?? null, input: {} });
-        this._latestToolCalls.set(event.sessionID, event.id);
-      } else if (event?.type === 'session.tool.input.ended' && event.id) {
-        const previous = this._toolParts.get(event.id);
+      const data = event?.data && typeof event.data === 'object' ? event.data : event;
+      if (event?.type === 'session.tool.input.started' && data?.id) {
+        this._toolParts.set(data.id, { sessionID: data.sessionID, tool: data.name ?? null, input: {} });
+        this._latestToolCalls.set(data.sessionID, data.id);
+      } else if (event?.type === 'session.tool.input.ended' && data?.id) {
+        const previous = this._toolParts.get(data.id);
         if (previous) {
           try {
-            const input = JSON.parse(event.text);
+            const input = JSON.parse(data.text);
             if (input && typeof input === 'object' && !Array.isArray(input)) previous.input = input;
           } catch {
             // called 事件还会带结构化 input，这里解析不到不影响后续
           }
         }
-      } else if (event?.type === 'session.tool.called' && event.id) {
-        const previous = this._toolParts.get(event.id) ?? {};
-        this._toolParts.set(event.id, {
-          sessionID: event.sessionID,
+      } else if (event?.type === 'session.tool.called' && data?.id) {
+        const previous = this._toolParts.get(data.id) ?? {};
+        this._toolParts.set(data.id, {
+          sessionID: data.sessionID,
           tool: previous.tool ?? null,
-          input: event.input ?? previous.input ?? {},
+          input: data.input ?? previous.input ?? {},
         });
-        this._latestToolCalls.set(event.sessionID, event.id);
+        this._latestToolCalls.set(data.sessionID, data.id);
+      } else if (event?.type === 'permission.asked' && data?.id && data?.sessionID) {
+        // v2 按目录过滤 /api/permission/request 在 macOS /var -> /private/var 等 cwd 差异下可能返回空，
+        // 从 SSE 事件流同步兜底每条待审批请求。
+        this._pendingPermissions.set(data.id, permissionPayload(data));
+        if (this._pendingPermissions.size > 200) {
+          this._pendingPermissions.delete(this._pendingPermissions.keys().next().value);
+        }
+      } else if (event?.type === 'permission.replied' || event?.type === 'permission.responded') {
+        const pid = data?.id ?? data?.permissionID;
+        if (typeof pid === 'string' && pid) this._pendingPermissions.delete(pid);
       }
     } else {
       const part = event?.type === 'message.part.updated' ? event.properties?.part : undefined;
@@ -672,6 +718,7 @@ export class OcClient {
 
   /** 拒掉一条审批（失败由调用方吞） */
   _replyPermission(p, message) {
+    this._pendingPermissions.delete(p.id);
     if (this.apiMajor >= 2) {
       return this._request(
         `${this.baseUrl}/api/session/${encodeURIComponent(p.sessionID)}/permission/${encodeURIComponent(p.id)}/reply`,
@@ -705,20 +752,32 @@ export class OcClient {
     let active = true;
 
     const sweep = async ({ final = false } = {}) => {
-      let pending;
+      let fetched = [];
+      let fetchOk = false;
       try {
         const path = this.apiMajor >= 2 ? '/api/permission/request' : '/permission';
         const res = await this._request(`${this.baseUrl}${path}`, { timeoutMs: 5_000 });
-        pending = this.apiMajor >= 2
+        fetched = this.apiMajor >= 2
           ? (Array.isArray(res.json?.data) ? res.json.data.map(permissionPayload) : [])
           : (Array.isArray(res.json) ? res.json : []);
+        fetchOk = true;
       } catch {
-        return; // 问不出来就等下一轮；收尾轮询问不出来就算了
+        // 问不出来时继续处理 SSE 已捕获到的 _pendingPermissions
       }
-      for (const p of pending) {
+      const merged = new Map();
+      for (const p of fetched) {
+        if (p && typeof p.id === 'string') merged.set(p.id, p);
+      }
+      for (const [id, p] of this._pendingPermissions) {
+        if (!merged.has(id)) merged.set(id, p);
+      }
+      if (!fetchOk && merged.size === 0) return;
+
+      for (const p of merged.values()) {
         if (!active && !final) break; // 转交已命中，别再碰新的审批
         if (!p || p.sessionID !== sessionID || typeof p.id !== 'string' || seen.has(p.id)) continue;
         seen.add(p.id);
+        this._pendingPermissions.delete(p.id);
         if (stats) stats.nativeBlocked += 1;
         const outcome = await this._resolveOne(p, final ? null : handoff).catch(() => null);
         if (outcome?.handoff) {
@@ -739,6 +798,9 @@ export class OcClient {
       active = false;
       clearInterval(timer);
       await sweep({ final: true }).catch(() => {});
+      for (const [id, pending] of this._pendingPermissions) {
+        if (pending?.sessionID === sessionID) this._pendingPermissions.delete(id);
+      }
     };
   }
 
@@ -821,6 +883,14 @@ export class OcClient {
       if (this.isolate) ensureRuntimeDirs(this.runtimeRoot);
       mkdirSync(this.workdir, { recursive: true });
       this._prepareV2Config();
+      if (this.isolate) {
+        await syncIsolatedOpencodeAuth({
+          runtimeRoot: this.runtimeRoot,
+          enabled: this.shareOpencodeAuth === true,
+        }).catch((err) => {
+          this._log(`[OC Faucet] 同步 OpenCode 登录态失败（已忽略，继续匿名运行）：${err?.message ?? err}`);
+        });
+      }
     } catch (error) {
       throw new BridgeError(
         `建不出工作目录 ${this.workdir}：${error?.message ?? error}。请检查该路径有没有写入权限。`,
@@ -1208,6 +1278,7 @@ export class OcClient {
 
   /** 删除会话；失败不抛（只记日志） */
   async deleteSession(sessionID) {
+    if (this.isolate) clearSessionSystemPrompt(this.runtimeRoot, sessionID);
     const prefix = this.apiMajor >= 2 ? '/api/session' : '/session';
     const res = await this._request(
       `${this.baseUrl}${prefix}/${encodeURIComponent(sessionID)}`,
@@ -1224,7 +1295,7 @@ export class OcClient {
   }
 
   /** v2 的 prompt 只负责入队：先选模型，再等 idle，最后把 assistant 投影回旧响应形状。 */
-  async _promptV2(sessionID, body, { timeoutMs, signal }) {
+  async _promptV2(sessionID, body, { timeoutMs, signal, isContinuation = false }) {
     const prefix = `${this.baseUrl}/api/session/${encodeURIComponent(sessionID)}`;
     const deadline = Date.now() + timeoutMs;
     const call = (path, { method = 'GET', payload } = {}) => this._request(path, {
@@ -1243,8 +1314,15 @@ export class OcClient {
       .filter((part) => part?.type === 'text' && typeof part.text === 'string')
       .map((part) => part.text)
       .join('');
-    // v2 的系统词挂在 agent 配置上；每次请求不同的信封指令只能随本条输入一起下发。
-    const text = body.system ? `${body.system}\n\n${userText}` : userText;
+    let text = userText;
+    if (body.system && !isContinuation) {
+      if (this.isolate) {
+        // v2 隔离模式：系统词由插件 context hook 追加到真实 system prompt 尾部，保持首条 user 纯净
+        writeSessionSystemPrompt(this.runtimeRoot, sessionID, body.system);
+      } else {
+        text = `${body.system}\n\n${userText}`;
+      }
+    }
     const submitted = await call(`${prefix}/prompt`, { method: 'POST', payload: { text } });
     if (!submitted.ok) return submitted;
 
@@ -1291,6 +1369,7 @@ export class OcClient {
       text,
       variant,
       handoff,
+      isContinuation = false,
       timeoutMs = DEFAULT_PROMPT_TIMEOUT_MS,
       signal,
     } = o;
@@ -1310,8 +1389,8 @@ export class OcClient {
 
     const wantHandoff = typeof handoff === 'function';
 
-    // 转交需要事件流拿被拦动作的名字与参数；纯拒批路径不养长连接
-    const stopEvents = wantHandoff ? this._watchEvents() : null;
+    // 转交与 v2 权限兜底都需要 SSE 事件流
+    const stopEvents = (wantHandoff || this.apiMajor >= 2) ? this._watchEvents() : null;
     // 消息 POST 的总闸：调用方信号和转交命中都从这里掐
     const fetchAbort = new AbortController();
     let detachCallerAbort = null;
@@ -1345,7 +1424,7 @@ export class OcClient {
     try {
       if (stopEvents?.ready) await stopEvents.ready;
       const messagePromise = this.apiMajor >= 2
-        ? this._promptV2(sessionID, body, { timeoutMs, signal: fetchAbort.signal })
+        ? this._promptV2(sessionID, body, { timeoutMs, signal: fetchAbort.signal, isContinuation })
         : this._request(`${this.baseUrl}/session/${encodeURIComponent(sessionID)}/message`, {
           method: 'POST',
           body,
@@ -1405,6 +1484,25 @@ export class OcClient {
         );
       }
 
+      const meta = extractStructuredErrorMeta(res.json);
+      const classified = classifyUpstreamError({
+        status: meta.status ?? res.status,
+        code: meta.code,
+        message: [detail, meta.responseBody, res.text].filter(Boolean).join(' '),
+        headers: res.headers,
+        retryAfterMs: meta.retryAfterMs,
+      });
+      if (classified.kind === 'rate_limit') {
+        const err = new BridgeError(
+          `上游返回限流/免费额度已用尽（HTTP ${res.status}）${detail ? `：${detail}` : ''}。请稍后再试或切换账号/网络。`,
+          429,
+          'upstream_rate_limited',
+        );
+        err.retryAfterMs = classified.retryAfterMs;
+        err.retryAfterSeconds = Math.ceil(classified.retryAfterMs / 1000);
+        throw err;
+      }
+
       const hint =
         res.json?.name === 'UnknownError'
           ? '（多半是这个模型或供应商在本机 OpenCode 里没配好）'
@@ -1427,11 +1525,21 @@ export class OcClient {
 
     const info = payload.info;
     if (info && info.error) {
-      throw new BridgeError(
-        `模型这次报错了：${describeErrorBody(info.error) || JSON.stringify(info.error).slice(0, 300)}`,
-        502,
-        'upstream_error',
-      );
+      const detail = describeErrorBody(info.error) || JSON.stringify(info.error).slice(0, 300);
+      const meta = extractStructuredErrorMeta(info.error);
+      const classified = classifyUpstreamError({
+        status: meta.status,
+        code: meta.code,
+        message: [detail, meta.responseBody].filter(Boolean).join(' '),
+        retryAfterMs: meta.retryAfterMs,
+      });
+      if (classified.kind === 'rate_limit') {
+        const err = new BridgeError(`上游返回限流/免费额度已用尽：${detail}`, 429, 'upstream_rate_limited');
+        err.retryAfterMs = classified.retryAfterMs;
+        err.retryAfterSeconds = Math.ceil(classified.retryAfterMs / 1000);
+        throw err;
+      }
+      throw new BridgeError(`模型这次报错了：${detail}`, 502, 'upstream_error');
     }
 
     // 把所有 text part 按顺序拼接——实测可能被切成好几段，漏拼会丢内容

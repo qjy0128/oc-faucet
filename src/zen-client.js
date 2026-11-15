@@ -18,11 +18,15 @@
  *   - 每次调用自成一话（新 ses_ id），不做按对话的会话亲和（缓存命中让位于正确性）。
  */
 import { BridgeError } from './errors.js';
+import { classifyUpstreamError, extractRetryAfterMsFromBody } from './cooldown.js';
+import { extractOpencodeBearerKey, readNativeOpencodeAuth } from './opencode-auth.js';
 import { rejectFeedback } from './handoff.js';
 import { BunTransport } from './zen-bun-transport.js';
 import {
   MODELS_DEV_URL,
   OPENCODE_ANONYMOUS_KEY,
+  OPENCODE_CORE_TOOLS,
+  OPENCODE_HARNESS_SYSTEM,
   createSessionRegistry,
   impersonationHeaders,
   openCodeNewID,
@@ -36,15 +40,117 @@ const CATALOG_TIMEOUT_MS = 30_000;
 
 const OPENCODE_ENVIRONMENT = '<env>\n  Working directory: unknown\n</env>';
 const HAS_ENVIRONMENT = /<env>[\s\S]*Working directory:[\s\S]*<\/env>/;
-const RETRIES = 7;
+const HAS_HARNESS = /^\s*You are an AI agent running in OpenCode\b/;
+const STUB_TOOL_NAMES = new Set([...OPENCODE_CORE_TOOLS, 'bash']);
+// 控制短暂 5xx 重试次数：最多重试 2 次（共 3 轮），遇到 429/限流不重试，避免打穿日限额。
+const RETRIES = 2;
 const RETRY_DELAY = 250;
 const RETRY_DELAY_MAX = 1_000;
 const SESSION_TRIES = 2;
 
 function withEnvironment(text) {
-  const body = typeof text === 'string' ? text : '';
+  const raw = typeof text === 'string' ? text.trim() : '';
+  const body = !raw
+    ? OPENCODE_HARNESS_SYSTEM
+    : (HAS_HARNESS.test(raw) ? raw : `${OPENCODE_HARNESS_SYSTEM}\n\n${raw}`);
   if (HAS_ENVIRONMENT.test(body)) return body;
-  return body ? `${body}\n\n${OPENCODE_ENVIRONMENT}` : OPENCODE_ENVIRONMENT;
+  return `${body}\n\n${OPENCODE_ENVIRONMENT}`;
+}
+
+function serializeAssistantGroup(items, { envelope = false } = {}) {
+  const texts = [];
+  const calls = [];
+  for (const item of items) {
+    if (item?.type === 'text' && typeof item.text === 'string' && item.text) {
+      texts.push(item.text);
+    } else if (item?.type === 'tool_use') {
+      calls.push({ name: item.name, arguments: item.input ?? {} });
+    }
+  }
+  const contentText = texts.join('\n');
+  if (calls.length > 0 || envelope) {
+    return JSON.stringify({ content: contentText, calls });
+  }
+  return contentText;
+}
+
+function formatUserGroup(dialect, items, images) {
+  const parts = [];
+  const appendText = (chunk) => {
+    if (!chunk) return;
+    const prev = parts[parts.length - 1];
+    if (prev && prev.type === 'text') {
+      prev.text = `${prev.text}\n${chunk}`;
+    } else {
+      parts.push({ type: 'text', text: chunk });
+    }
+  };
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'text') {
+      appendText(item.text ?? '');
+    } else if (item.type === 'tool_result') {
+      const output = typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '');
+      const label = item.error ? '执行失败' : '执行结果';
+      appendText(`[工具${label} call_id=${item.callId || 'unknown'}]\n${output}`);
+    } else if (item.type === 'image') {
+      const img = Array.isArray(images) ? images[item.image - 1] : null;
+      if (!img) {
+        appendText(`[图片 #${item.image} (${item.mediaType || 'image'})]`);
+        continue;
+      }
+      if (dialect === 'anthropic') {
+        parts.push({
+          type: 'image',
+          source: { type: 'base64', media_type: img.media_type, data: img.data },
+        });
+      } else if (dialect === 'responses') {
+        parts.push({
+          type: 'input_image',
+          image_url: `data:${img.media_type};base64,${img.data}`,
+        });
+      } else {
+        parts.push({
+          type: 'image_url',
+          image_url: { url: `data:${img.media_type};base64,${img.data}` },
+        });
+      }
+    }
+  }
+  if (!parts.length) return '';
+  if (parts.length === 1 && parts[0].type === 'text') return parts[0].text;
+  if (dialect === 'responses') {
+    return parts.map((p) => (p.type === 'text' ? { type: 'input_text', text: p.text } : p));
+  }
+  return parts;
+}
+
+function buildStructuredTurns(dialect, history, images, { envelope = false } = {}) {
+  if (!Array.isArray(history) || !history.length) return null;
+  const groups = [];
+  for (const item of history) {
+    if (!item || typeof item !== 'object') continue;
+    const role = item.role === 'assistant' ? 'assistant' : 'user';
+    const prev = groups[groups.length - 1];
+    if (prev && prev.role === role) {
+      prev.items.push(item);
+    } else {
+      groups.push({ role, items: [item] });
+    }
+  }
+  if (!groups.length) return null;
+  if (groups[0].role === 'assistant') {
+    groups.unshift({ role: 'user', items: [{ role: 'user', type: 'text', text: '请继续。' }] });
+  }
+  const turns = groups.map((group) => ({
+    role: group.role,
+    content: group.role === 'assistant'
+      ? (serializeAssistantGroup(group.items, { envelope }) || '（无输出）')
+      : (formatUserGroup(dialect, group.items, images) || ' '),
+  }));
+  // 最后一轮若不是 user，退回单条扁平文本模式，防止部分上游拒绝 assistant prefill。
+  if (turns[turns.length - 1].role !== 'user') return null;
+  return turns;
 }
 
 function pause(ms, signal) {
@@ -96,6 +202,8 @@ export class ZenClient {
     this.#transport = o.transport ?? null;
     this.#bunPath = o.bunPath;
     this.#sidecarPath = o.sidecarPath;
+    this.#shareOpencodeAuth = o.shareOpencodeAuth === true;
+    this.#cachedAuthKey = undefined;
   }
 
   #started;
@@ -106,6 +214,8 @@ export class ZenClient {
   #transport;
   #bunPath;
   #sidecarPath;
+  #shareOpencodeAuth;
+  #cachedAuthKey;
 
   #handleSidecarExit(detail) {
     this.#started = false;
@@ -132,6 +242,9 @@ export class ZenClient {
 
   /** 起 Bun 侧车；测试可注入 fetch 直接走本地桩。 */
   async start() {
+    this.#cachedAuthKey = this.#shareOpencodeAuth
+      ? extractOpencodeBearerKey(await readNativeOpencodeAuth())
+      : null;
     if (!this.#fetchImpl) {
       this.#transport ??= new BunTransport({
         baseOrigin: this.#baseOrigin,
@@ -317,6 +430,9 @@ export class ZenClient {
       modelID,
       system,
       text,
+      history,
+      images,
+      envelope = false,
       variant,
       handoff,
       timeoutMs = DEFAULT_PROMPT_TIMEOUT_MS,
@@ -331,10 +447,10 @@ export class ZenClient {
     }
 
     const dialect = this.#dialects.get(modelID) ?? 'chat';
-    const messages = this.#seedMessages(dialect, { system, text });
+    const messages = this.#seedMessages(dialect, { system, text, history, images, envelope });
 
     const first = await this.#round(dialect, modelID, sessionID, messages, { timeoutMs, signal });
-    const stubCalls = first.calls.filter((call) => call.name === 'bash' || call.name === 'read');
+    const stubCalls = first.calls.filter((call) => STUB_TOOL_NAMES.has(call.name));
     if (!stubCalls.length) {
       const dropped = first.calls.length
         ? '（模型调用了本会话没有提供的工具，该调用已忽略。）'
@@ -381,8 +497,27 @@ export class ZenClient {
   /* 内部：一轮请求                                                      */
   /* ------------------------------------------------------------------ */
 
-  /** 按方言拼初始消息（信封 system + 一条 user 文本；历史已摊平在信封文本里） */
-  #seedMessages(dialect, { system, text }) {
+  /** 按方言拼初始消息（带结构化历史时保留真实多轮消息前缀以命中 KV Cache；否则沿用单条文本） */
+  #seedMessages(dialect, { system, text, history, images, envelope = false }) {
+    const turns = buildStructuredTurns(dialect, history, images, { envelope });
+    if (turns) {
+      if (dialect === 'anthropic') {
+        return { system: withEnvironment(system), messages: turns };
+      }
+      if (dialect === 'responses') {
+        const input =
+          turns.length === 1 && turns[0].role === 'user' && typeof turns[0].content === 'string'
+            ? turns[0].content
+            : turns.map((t) => ({ role: t.role, content: t.content }));
+        return { instructions: withEnvironment(system), input };
+      }
+      return {
+        messages: [
+          { role: 'system', content: withEnvironment(system) },
+          ...turns,
+        ],
+      };
+    }
     if (dialect === 'anthropic') {
       return { system: withEnvironment(system), messages: [{ role: 'user', content: text }] };
     }
@@ -413,10 +548,11 @@ export class ZenClient {
       };
     }
     if (dialect === 'responses') {
+      const prior = Array.isArray(seed.input) ? seed.input : [seed.input];
       return {
         instructions: seed.instructions,
         input: [
-          seed.input,
+          ...prior,
           ...calls.map((call) => ({ type: 'function_call', call_id: call.id, name: call.name, arguments: JSON.stringify(call.arguments) })),
           ...calls.map((call) => ({ type: 'function_call_output', call_id: call.id, output: feedback })),
         ],
@@ -469,9 +605,15 @@ export class ZenClient {
         signal,
       });
       if (res.ok || res.status < 500 || attempt >= RETRIES) break;
+      const errKind = classifyUpstreamError({
+        status: res.status,
+        message: this.#errorDetail(res.text) || res.text,
+        headers: res.headers,
+      }).kind;
+      if (errKind === 'rate_limit') break;
       await pause(Math.min(RETRY_DELAY * 2 ** attempt, RETRY_DELAY_MAX), signal);
     }
-    if (!res.ok) throw this.#mapUpstreamError(res.status, res.text);
+    if (!res.ok) throw this.#mapUpstreamError(res.status, res.text, res.headers);
     const gathered = this.#gather(dialect, res.text);
     if (!gathered.events) {
       throw new BridgeError(
@@ -513,7 +655,7 @@ export class ZenClient {
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       const text = await res.text();
-      return { status: res.status, ok: res.ok, text };
+      return { status: res.status, ok: res.ok, headers: res.headers, text };
     } catch (error) {
       if (signal?.aborted) {
         throw new BridgeError('请求被调用方取消。', 499, 'client_closed_request');
@@ -531,17 +673,24 @@ export class ZenClient {
   }
 
   #authHeadersFor(dialect) {
-    const headers = { authorization: `Bearer ${OPENCODE_ANONYMOUS_KEY}` };
+    const key = this.#cachedAuthKey || OPENCODE_ANONYMOUS_KEY;
+    const headers = { authorization: `Bearer ${key}` };
     if (dialect === 'anthropic') {
-      headers['x-api-key'] = OPENCODE_ANONYMOUS_KEY;
+      headers['x-api-key'] = key;
       headers['anthropic-version'] = '2023-06-01';
     }
     return headers;
   }
 
   /** 把上游的失败翻成能看懂的人话；原文保留片段 */
-  #mapUpstreamError(status, text) {
+  #mapUpstreamError(status, text, headers) {
     const detail = this.#errorDetail(text);
+    const classified = classifyUpstreamError({
+      status,
+      message: detail || text,
+      headers,
+      retryAfterMs: extractRetryAfterMsFromBody(text),
+    });
     if (status === 403) {
       return new BridgeError(
         `zen 返回 HTTP 403，拒绝了这次免费请求${detail ? `（${detail}）` : ''}。模型可能刚被轮下线，或请求形状被认出；可以稍后重试，或切回内嵌模式。`,
@@ -559,12 +708,15 @@ export class ZenClient {
     if (status === 410) {
       return new BridgeError(`zen 返回 HTTP 410，这个模型已被弃用${detail ? `：${detail}` : ''}。请换一个模型（目录刷新后会反映）。`, 502, 'zen_model_deprecated');
     }
-    if (status === 429) {
-      return new BridgeError(
-        `zen 返回 HTTP 429：免费额度或当前网络/IP 被限流${detail ? `（${detail}）` : ''}。等额度重置、切换网络，或切回内嵌模式。`,
+    if (status === 429 || classified.kind === 'rate_limit') {
+      const err = new BridgeError(
+        `zen 返回 HTTP ${status}：免费额度或当前网络/IP 被限流${detail ? `（${detail}）` : ''}。等额度重置、切换网络，或切回内嵌模式。`,
         429,
         'zen_rate_limited',
       );
+      err.retryAfterMs = classified.retryAfterMs;
+      err.retryAfterSeconds = Math.ceil(classified.retryAfterMs / 1000);
+      return err;
     }
     return new BridgeError(`模型这次没能给出回答（zen HTTP ${status}）${detail ? `：${detail}` : '，上游没有给出可读的说明'}`, 502, 'upstream_error');
   }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { OcClient } from '../src/oc-client.js';
@@ -236,7 +236,12 @@ test('v2 提问走选模型、提交、等待和读取消息，并拼接正文�
   assert.deepEqual(calls.find((entry) => entry.path.endsWith('/model')).body, {
     model: { providerID: 'opencode', id: 'demo-free', variant: 'high' },
   });
-  assert.match(calls.find((entry) => entry.path.endsWith('/prompt')).body.text, /系统指令[\s\S]*请回答/);
+  // v2 隔离模式下通过 bridge.js 的 context hook 注入 system，/prompt 只发纯净的用户输入
+  assert.equal(calls.find((entry) => entry.path.endsWith('/prompt')).body.text, '请回答');
+  assert.equal(readFileSync(join(client.runtimeRoot, 'session-systems', `${sessionID}.txt`), 'utf8'), '系统指令');
+  const pluginSrc = readFileSync(join(client.runtimeRoot, 'config', 'opencode', 'plugins', 'bridge.js'), 'utf8');
+  assert.match(pluginSrc, /session\.hook\('context'/);
+  assert.match(pluginSrc, /execute\.before/);
   assert.ok(calls.some((entry) => entry.path.endsWith('/wait')));
   assert.ok(calls.some((entry) => entry.path.endsWith('/message') && entry.query.type === 'assistant'));
 });
@@ -275,4 +280,69 @@ test('v2 上下文设置只写隔离配置并重载 location', async (t) => {
   });
   const response = await fetch(`${client.baseUrl}/__reloads`);
   assert.equal((await response.json()).reloads, 1);
+});
+
+test('v2.2.7 SSE 嵌套 event.data 与 permission.asked(source.id) 兜底：/api/permission/request 返回空仍能转交拒批', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'oc-v2-sse-perm-'));
+  t.after(() => rmSync(dataDir, { recursive: true, force: true }));
+
+  const replies = [];
+  const client = new OcClient({ dataDir });
+  client.port = 43211;
+  client.started = true;
+  client.exited = false;
+  client.apiMajor = 2;
+  client._request = async (url, options = {}) => {
+    const path = new URL(url).pathname;
+    if (path === '/api/permission/request') {
+      // 模拟 macOS /var -> /private/var 目录不匹配时 HTTP 列表返回空数组
+      return { ok: true, status: 200, json: { location: {}, data: [] } };
+    }
+    if (/\/permission\/[^/]+\/reply$/.test(path)) {
+      replies.push({ path, body: options.body });
+      return { ok: true, status: 200, json: {} };
+    }
+    throw new Error(`unexpected path: ${path}`);
+  };
+
+  let handedOff = null;
+  const stop = client._handlePermissions('ses_real', {
+    handoff: (action) => action.native === 'shell'
+      ? { name: 'Bash', arguments: { command: action.input.command } }
+      : null,
+    onHandoff: (call) => { handedOff = call; },
+    stats: { nativeBlocked: 0 },
+  });
+
+  // 真实 OpenCode v2.2.7 SSE 事件把载荷放在 event.data 里，工具 callID 在 source.id
+  client._handleEvent({
+    id: 'evt_1',
+    type: 'session.tool.input.started',
+    data: { sessionID: 'ses_real', assistantMessageID: 'msg_1', id: 'call_real_1', name: 'shell' },
+  });
+  client._handleEvent({
+    id: 'evt_2',
+    type: 'session.tool.called',
+    data: { sessionID: 'ses_real', assistantMessageID: 'msg_1', id: 'call_real_1', input: { command: 'pwd' }, executed: false },
+  });
+  client._handleEvent({
+    id: 'evt_3',
+    type: 'permission.asked',
+    data: {
+      id: 'per_real_1',
+      sessionID: 'ses_real',
+      action: 'shell',
+      resources: ['pwd'],
+      source: { type: 'tool', messageID: 'msg_1', id: 'call_real_1' },
+    },
+  });
+
+  for (let i = 0; i < 20 && !handedOff; i += 1) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  await stop();
+
+  assert.deepEqual(handedOff, { name: 'Bash', arguments: { command: 'pwd' } });
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].body.decision, 'reject');
 });

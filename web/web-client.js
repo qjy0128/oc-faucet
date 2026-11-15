@@ -119,6 +119,9 @@
     installTarget: (id, modelIds) => post('/api/targets/install', { id, modelIds }),
     uninstallTarget: (id) => post('/api/targets/uninstall', { id }),
     setModelContextWindow: (id, value) => post('/api/models/context-window', { id, value }),
+    setModelBlocked: (id, blocked = true) => post('/api/models/block', { id, blocked }),
+    checkOpencodeEnv: () => post('/api/opencode/check'),
+    openOpencodeInstall: async () => ({ url: 'https://opencode.ai', opened: false }),
     // 密钥只在显式请求时经带令牌接口返回，快照里没有（工单 05）
     getApiKey: () => api('/api/key'),
     setApiKey: (key) => post('/api/key', { key }),

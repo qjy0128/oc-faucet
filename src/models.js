@@ -280,6 +280,83 @@ export function faucetModels(models) {
 }
 
 /**
+ * 归一化屏蔽规则里的模型 ID：允许完整 `provider/model` 或简写 `model`，拒绝空白、首尾斜杠或空段。
+ *
+ * @param {unknown} raw
+ * @returns {string|null}
+ */
+export function normalizeBlockedModelId(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || /\s/.test(trimmed)) return null;
+  if (trimmed.includes('/')) {
+    const slash = trimmed.indexOf('/');
+    const provider = trimmed.slice(0, slash);
+    const model = trimmed.slice(slash + 1);
+    if (!provider || !model) return null;
+    return `${provider}/${model}`;
+  }
+  return trimmed;
+}
+
+/**
+ * 判断模型或模型 ID 是否命中屏蔽列表，并返回命中的所有规则字符串。
+ *
+ * @param {{ id?: string, providerID?: string, modelID?: string } | string} modelOrId
+ * @param {Iterable<string>} blockedList
+ * @returns {string[]}
+ */
+export function findMatchedBlockRules(modelOrId, blockedList) {
+  if (!blockedList) return [];
+  const candidates = new Set();
+  if (typeof modelOrId === 'string') {
+    const normalized = normalizeBlockedModelId(modelOrId);
+    if (!normalized) return [];
+    candidates.add(normalized);
+    if (normalized.includes('/')) {
+      const slash = normalized.indexOf('/');
+      candidates.add(normalized.slice(slash + 1));
+    } else {
+      candidates.add(modelIdOf(FAUCET_PROVIDER_ID, normalized));
+    }
+  } else if (modelOrId && typeof modelOrId === 'object') {
+    if (typeof modelOrId.id === 'string' && modelOrId.id) candidates.add(modelOrId.id);
+    if (typeof modelOrId.modelID === 'string' && modelOrId.modelID) {
+      candidates.add(modelOrId.modelID);
+      if (typeof modelOrId.providerID === 'string' && modelOrId.providerID) {
+        candidates.add(modelIdOf(modelOrId.providerID, modelOrId.modelID));
+      }
+    }
+  }
+  if (!candidates.size) return [];
+
+  const matched = [];
+  for (const rule of blockedList) {
+    const normalizedRule = normalizeBlockedModelId(rule);
+    if (!normalizedRule) continue;
+    if (candidates.has(normalizedRule)) {
+      matched.push(normalizedRule);
+      continue;
+    }
+    if (!normalizedRule.includes('/') && candidates.has(modelIdOf(FAUCET_PROVIDER_ID, normalizedRule))) {
+      matched.push(normalizedRule);
+    }
+  }
+  return matched;
+}
+
+/**
+ * 判断模型或模型 ID 是否处于屏蔽状态。
+ *
+ * @param {{ id?: string, providerID?: string, modelID?: string } | string} modelOrId
+ * @param {Iterable<string>} blockedList
+ * @returns {boolean}
+ */
+export function isModelBlocked(modelOrId, blockedList) {
+  return findMatchedBlockRules(modelOrId, blockedList).length > 0;
+}
+
+/**
  * 按来源把模型清单摊开：每个来源轮流取一个，取完为止。
  *
  * 注意：`faucetModels()` 只放 `opencode` 一家进来，所以**当前调用它是空操作**

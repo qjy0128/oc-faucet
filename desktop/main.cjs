@@ -25,6 +25,9 @@ const IPC_CHANNELS = [
   'oc:install-target',
   'oc:uninstall-target',
   'oc:set-model-context-window',
+  'oc:set-model-blocked',
+  'oc:check-opencode',
+  'oc:open-opencode-install',
   'oc:get-api-key',
   'oc:set-api-key',
   'oc:settings',
@@ -169,7 +172,10 @@ function pushUpdateState(state) {
 function registerIpc() {
   // 渲染进程主动要状态时先实读一遍各目标配置再回快照（pushState 是推送通道，不动）
   ipcMain.handle('oc:state', async () => {
-    await bridge.listTargetStates();
+    await Promise.all([
+      bridge.listTargetStates(),
+      bridge.checkOpencodeEnv(),
+    ]);
     return bridge.snapshot();
   });
 
@@ -231,6 +237,23 @@ function registerIpc() {
     const result = await bridge.setModelContextWindow(id, value);
     pushState();
     return result;
+  });
+
+  ipcMain.handle('oc:set-model-blocked', async (_e, { id, blocked } = {}) => {
+    const result = await bridge.setModelBlocked(id, blocked !== false);
+    pushState();
+    return result;
+  });
+
+  ipcMain.handle('oc:check-opencode', async () => {
+    const status = await bridge.checkOpencodeEnv({ force: true });
+    pushState();
+    return status;
+  });
+
+  ipcMain.handle('oc:open-opencode-install', async () => {
+    await shell.openExternal('https://opencode.ai');
+    return { url: 'https://opencode.ai', opened: true };
   });
 
   // 密钥只在界面显式读改时经这一对通道走，状态推送里不携带
@@ -339,9 +362,12 @@ app.whenReady().then(async () => {
 
   try {
     bridge = await loadBridge();
+    // 打开窗口后先立刻检查一次本机 OpenCode 安装与运行情况，不等服务启动完成
+    await bridge.checkOpencodeEnv({ force: true });
     // 先给界面一个"正在启动"的状态，避免窗口白屏
     pushState();
     await bridge.start();
+    await bridge.checkOpencodeEnv({ force: true });
     pushState();
 
     // 启动后自动跑一轮：拉目录 → 体检

@@ -24,13 +24,23 @@ const SNIPPET_LIMIT = 200;
 const FLATTENED_KEYS = ['name', 'arguments', 'tool_calls', 'function'];
 
 /** 解析失败（模型没按信封说话、JSON 不合法、结构不明） */
-function invalidOutput(message) {
-  return new BridgeError(message, 502, 'invalid_model_output');
+function invalidOutput(message, diagnostic) {
+  return new BridgeError(message, 502, 'invalid_model_output', diagnostic);
 }
 
 /** 信封本身说得通，但里面的工具调用违反约定（名字、参数、数量） */
-function invalidCall(message) {
-  return new BridgeError(message, 502, 'invalid_tool_call');
+function invalidCall(message, diagnostic) {
+  return new BridgeError(message, 502, 'invalid_tool_call', diagnostic);
+}
+
+function valueType(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (value === undefined) return 'missing';
+  if (typeof value === 'string') return 'string';
+  if (typeof value === 'number') return 'number';
+  if (typeof value === 'boolean') return 'boolean';
+  return 'object';
 }
 
 /** 错误信息里要带上模型的原文，太长就截断 */
@@ -86,7 +96,7 @@ export function buildSystem(o = {}) {
   const client = clients[flavor];
 
   const lines = [
-    `你是接在本机转发服务「OC Faucet」后面的上游模型（${upstream}），本次请求来自外部客户端 ${client}。`,
+    `你是为外部客户端 ${client} 提供推理的上游模型（${upstream}）。`,
     '你在这条链路里只负责「决定下一步」，请严格遵守下面九条约定：',
     '1. 你只负责决定下一步做什么，真正的执行全部由外部客户端完成；你自己没有执行能力。整段对话历史都以 JSON 的形式在下面给出，你依据它判断当前该做什么。',
     '2. 只能用本次请求里列出的外部工具。工具名和参数名必须逐字照抄，不许换成相似或更顺口的名字；不许调用你自己的任何工具（包括读写文件、执行命令、联网搜索等），不许在本机执行任何命令，不许编造清单里没有的工具。',
@@ -133,7 +143,10 @@ export function decodeEnvelope(text, request) {
   const names = toolNames(tools);
 
   if (typeof text !== 'string') {
-    throw invalidOutput(`模型回复不是一个字符串（实际是 ${describe(text)}），桥无法解析信封。请重试，或换一个模型。`);
+    throw invalidOutput(`模型回复不是一个字符串（实际是 ${describe(text)}），桥无法解析信封。请重试，或换一个模型。`, {
+      reason: 'model_reply_not_string',
+      valueType: valueType(text),
+    });
   }
 
   const envelope = parseJsonObject(text);
@@ -142,7 +155,14 @@ export function decodeEnvelope(text, request) {
   if (flattened.length) {
     throw invalidOutput(
       `模型返回的是「摊平」的工具调用——顶层直接出现了 ${flattened.join('、')}，这不是约定的信封格式（信封必须是 {"content":"...","calls":[{"name":"...","arguments":{}}]}）。` +
-        `桥不猜这种写法，以免读错工具或参数、把动作当成已完成。原文：${snippet(text)}。请重试，或换一个模型。`
+        `桥不猜这种写法，以免读错工具或参数、把动作当成已完成。原文：${snippet(text)}。请重试，或换一个模型。`,
+      {
+        reason: 'envelope_flattened_tool_call',
+        hasName: flattened.includes('name'),
+        hasArguments: flattened.includes('arguments'),
+        hasToolCalls: flattened.includes('tool_calls'),
+        hasFunction: flattened.includes('function'),
+      },
     );
   }
 
@@ -151,7 +171,8 @@ export function decodeEnvelope(text, request) {
   if (!hasContent && !hasCalls) {
     throw invalidOutput(
       `模型返回的 JSON 里既没有 content 也没有 calls，桥看不懂它想做什么（原文：${snippet(text)}）。` +
-        `为避免把动作当成已完成，这次回复被拒绝。请重试，或换一个模型。`
+        `为避免把动作当成已完成，这次回复被拒绝。请重试，或换一个模型。`,
+      { reason: 'envelope_fields_missing', hasContent: false, hasCalls: false },
     );
   }
 
@@ -162,7 +183,8 @@ export function decodeEnvelope(text, request) {
     else if (typeof value === 'string') content = value;
     else {
       throw invalidOutput(
-        `模型返回的 content 必须是字符串（或 null），实际是 ${describe(value)}。原文：${snippet(text)}。请重试，或换一个模型。`
+        `模型返回的 content 必须是字符串（或 null），实际是 ${describe(value)}。原文：${snippet(text)}。请重试，或换一个模型。`,
+        { reason: 'envelope_content_type_invalid', valueType: valueType(value) },
       );
     }
   }
@@ -177,7 +199,8 @@ export function decodeEnvelope(text, request) {
       } catch {
         throw invalidOutput(
           `模型把 calls 写成了字符串，但它不是合法的 JSON，没法还原成工具调用：${describe(value)}。` +
-            `桥宁可报错也不猜，以免丢动作。请重试，或换一个模型。`
+            `桥宁可报错也不猜，以免丢动作。请重试，或换一个模型。`,
+          { reason: 'envelope_calls_json_invalid' },
         );
       }
     } else {
@@ -185,7 +208,8 @@ export function decodeEnvelope(text, request) {
     }
     if (!Array.isArray(rawCalls)) {
       throw invalidOutput(
-        `模型返回的 calls 必须是数组（也可以是一段能解析成数组的 JSON 字符串），实际是 ${describe(rawCalls)}。原文：${snippet(text)}。`
+        `模型返回的 calls 必须是数组（也可以是一段能解析成数组的 JSON 字符串），实际是 ${describe(rawCalls)}。原文：${snippet(text)}。`,
+        { reason: 'envelope_calls_type_invalid', valueType: valueType(rawCalls) },
       );
     }
   }
@@ -198,27 +222,38 @@ export function decodeEnvelope(text, request) {
     throw invalidCall(
       `本次请求明确不允许调用工具（tool_choice 是 none），但模型返回了 ${calls.length} 个工具调用（${calls
         .map((c) => c.name)
-        .join('、')}）。请重试，或在客户端把 auto_approve/工具选项调整一下。`
+        .join('、')}）。请重试，或在客户端把 auto_approve/工具选项调整一下。`,
+      { reason: 'tool_choice_none_violated', callCount: calls.length, toolChoice: 'none' },
     );
   }
   if (forced) {
     if (!calls.length) {
-      throw invalidCall(`本次请求要求必须调用工具「${forced}」，但模型一个工具调用都没有返回，只回了文字。请重试，或换一个模型。`);
+      throw invalidCall(`本次请求要求必须调用工具「${forced}」，但模型一个工具调用都没有返回，只回了文字。请重试，或换一个模型。`, {
+        reason: 'forced_tool_missing',
+        callCount: 0,
+        toolChoice: 'forced',
+      });
     }
     const wrong = calls.filter((call) => call.name !== forced);
     if (wrong.length) {
       throw invalidCall(
-        `本次请求要求只能调用工具「${forced}」，但模型还调用了 ${wrong.map((c) => `「${c.name}」`).join('、')}。请重试，或换一个模型。`
+        `本次请求要求只能调用工具「${forced}」，但模型还调用了 ${wrong.map((c) => `「${c.name}」`).join('、')}。请重试，或换一个模型。`,
+        { reason: 'forced_tool_mismatch', callCount: calls.length, mismatchedCallCount: wrong.length, toolChoice: 'forced' },
       );
     }
   } else if (choice === 'required' && !calls.length) {
-    throw invalidCall('本次请求要求「至少返回一个工具调用」，但模型一个工具调用都没有返回，只回了文字。请重试，或换一个模型。');
+    throw invalidCall('本次请求要求「至少返回一个工具调用」，但模型一个工具调用都没有返回，只回了文字。请重试，或换一个模型。', {
+      reason: 'required_tool_missing',
+      callCount: 0,
+      toolChoice: 'required',
+    });
   }
   if (!parallel && calls.length > 1) {
     throw invalidCall(
       `本次请求不允许并行调用（parallel 为 false，一次只准一个动作），但模型一次返回了 ${calls.length} 个工具调用（${calls
         .map((c) => c.name)
-        .join('、')}）。请重试，或换一个模型。`
+        .join('、')}）。请重试，或换一个模型。`,
+      { reason: 'parallel_tool_calls_disallowed', callCount: calls.length, parallelAllowed: false },
     );
   }
 
@@ -272,7 +307,8 @@ function parseJsonObject(text) {
 
   throw invalidOutput(
     `模型回复不是合法的 JSON，桥读不出信封内容：${snippet(text)}。` +
-      `为避免把没发生的动作当成已完成，这次回复被拒绝。请重试，或换一个模型（部分免费模型不会按信封协议回复）。`
+      `为避免把没发生的动作当成已完成，这次回复被拒绝。请重试，或换一个模型（部分免费模型不会按信封协议回复）。`,
+    { reason: 'envelope_json_invalid' },
   );
 }
 
@@ -281,7 +317,8 @@ function asObject(parsed, original) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw invalidOutput(
       `模型的回复是合法 JSON，但不是一个 JSON 对象，而是 ${describe(parsed)}。原文：${snippet(original)}。` +
-        `信封必须是 {"content":"...","calls":[...]} 这样的对象。请重试，或换一个模型。`
+        `信封必须是 {"content":"...","calls":[...]} 这样的对象。请重试，或换一个模型。`,
+      { reason: 'envelope_not_object', valueType: valueType(parsed) },
     );
   }
   return parsed;
@@ -297,7 +334,11 @@ function stripCodeFence(text) {
 function normalizeCall(entry, position, names) {
   const where = `第 ${position} 个工具调用`;
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-    throw invalidCall(`${where}不是一个对象，而是 ${describe(entry)}。每个调用必须是 {"name":"工具名","arguments":{}} 这样的对象。`);
+    throw invalidCall(`${where}不是一个对象，而是 ${describe(entry)}。每个调用必须是 {"name":"工具名","arguments":{}} 这样的对象。`, {
+      reason: 'tool_call_not_object',
+      callIndex: position,
+      valueType: valueType(entry),
+    });
   }
 
   let name;
@@ -306,10 +347,18 @@ function normalizeCall(entry, position, names) {
     // 等价写法：OpenAI 的 tool_calls 形状
     const fn = entry.function;
     if (!fn || typeof fn !== 'object' || Array.isArray(fn)) {
-      throw invalidCall(`${where}用了 OpenAI 的 function 写法，但 function 不是对象，而是 ${describe(fn)}。`);
+      throw invalidCall(`${where}用了 OpenAI 的 function 写法，但 function 不是对象，而是 ${describe(fn)}。`, {
+        reason: 'tool_function_not_object',
+        callIndex: position,
+        valueType: valueType(fn),
+      });
     }
     if (entry.type !== undefined && entry.type !== 'function') {
-      throw invalidCall(`${where}的类型是「${String(entry.type)}」，本桥只认识 type 为 'function' 的工具调用。`);
+      throw invalidCall(`${where}的类型是「${String(entry.type)}」，本桥只认识 type 为 'function' 的工具调用。`, {
+        reason: 'tool_call_type_unsupported',
+        callIndex: position,
+        valueType: valueType(entry.type),
+      });
     }
     name = fn.name;
     args = fn.arguments;
@@ -319,22 +368,27 @@ function normalizeCall(entry, position, names) {
   }
 
   if (typeof name !== 'string' || !name.trim()) {
-    throw invalidCall(`${where}没有给出工具名，或者工具名不是字符串（实际是 ${describe(name)}）。`);
+    throw invalidCall(`${where}没有给出工具名，或者工具名不是字符串（实际是 ${describe(name)}）。`, {
+      reason: 'tool_name_missing_or_invalid',
+      callIndex: position,
+      valueType: valueType(name),
+    });
   }
   name = name.trim();
   if (!names.has(name)) {
     const available = names.size ? [...names].join('、') : '（本次请求没有提供任何工具）';
     throw invalidCall(
       `${where}用了本次请求没有提供的工具「${name}」。本次可用的外部工具是：${available}。` +
-        `模型可能是凭空编造或记错了名字，桥不会代它猜一个相近的工具。`
+        `模型可能是凭空编造或记错了名字，桥不会代它猜一个相近的工具。`,
+      { reason: 'tool_name_unknown', callIndex: position, availableToolCount: names.size },
     );
   }
 
-  return { name, arguments: normalizeArguments(args, where) };
+  return { name, arguments: normalizeArguments(args, where, position) };
 }
 
 /** 参数必须是对象；字符串形式的参数要能 JSON.parse，解不开就报错 */
-function normalizeArguments(value, where) {
+function normalizeArguments(value, where, position) {
   if (value === undefined || value === null) return {}; // 无参数工具：补空对象，动作本身不丢
   if (typeof value === 'string') {
     let parsed;
@@ -343,16 +397,25 @@ function normalizeArguments(value, where) {
     } catch {
       throw invalidCall(
         `${where}的参数（arguments）是一段字符串，但不是合法的 JSON，没法还原成参数对象：${snippet(value)}。` +
-          `桥宁可报错也不猜，以免把动作当成已完成。请重试，或换一个模型。`
+          `桥宁可报错也不猜，以免把动作当成已完成。请重试，或换一个模型。`,
+        { reason: 'tool_arguments_json_invalid', callIndex: position },
       );
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw invalidCall(`${where}的参数（arguments）字符串解析出来是 ${describe(parsed)}，必须是 JSON 对象。`);
+      throw invalidCall(`${where}的参数（arguments）字符串解析出来是 ${describe(parsed)}，必须是 JSON 对象。`, {
+        reason: 'tool_arguments_json_not_object',
+        callIndex: position,
+        valueType: valueType(parsed),
+      });
     }
     return parsed;
   }
   if (typeof value !== 'object' || Array.isArray(value)) {
-    throw invalidCall(`${where}的参数（arguments）必须是对象（例如 {"path":"a.txt"}），实际是 ${describe(value)}。`);
+    throw invalidCall(`${where}的参数（arguments）必须是对象（例如 {"path":"a.txt"}），实际是 ${describe(value)}。`, {
+      reason: 'tool_arguments_type_invalid',
+      callIndex: position,
+      valueType: valueType(value),
+    });
   }
   return value;
 }

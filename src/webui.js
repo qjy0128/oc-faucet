@@ -140,7 +140,10 @@ export async function startWebUi({
     // 界面每 1.5s 轮询这条：先实读一遍各目标状态（单个目标失败由 listTargetStates
     // 自己兜底，不炸），再回快照——用户在外部改过目标配置，面板必须如实反映
     'GET /api/state': async () => {
-      await bridge.listTargetStates();
+      await Promise.all([
+        bridge.listTargetStates(),
+        typeof bridge.checkOpencodeEnv === 'function' ? bridge.checkOpencodeEnv() : null,
+      ]);
       return bridge.snapshot();
     },
 
@@ -185,6 +188,18 @@ export async function startWebUi({
       return bridge.setModelContextWindow(body.id, body.value);
     },
 
+    'POST /api/models/block': async (body) => {
+      if (typeof body.id !== 'string' || !body.id) {
+        throw new BridgeError('缺少模型 id。请传入要屏蔽或恢复的模型 ID。', 400, 'missing_model_id');
+      }
+      return bridge.setModelBlocked(body.id, body.blocked !== false);
+    },
+
+    'POST /api/opencode/check': async () => {
+      if (typeof bridge.checkOpencodeEnv !== 'function') return null;
+      return bridge.checkOpencodeEnv({ force: true });
+    },
+
     // 重启 / 关闭整个服务。和其它动作接口一样，必须带令牌。
     // 关闭属于正常停止：onStop 收摊前会把各接入目标里我们写入的配置一并摘除。
     'POST /api/restart': async () => {
@@ -223,6 +238,8 @@ export async function startWebUi({
       bridge.saveSettings({
         ...(body.probeConcurrency !== undefined ? { probeConcurrency: body.probeConcurrency } : {}),
         ...(body.probeTtlMinutes !== undefined ? { probeTtlMinutes: body.probeTtlMinutes } : {}),
+        ...(body.targetContextCap !== undefined ? { targetContextCap: body.targetContextCap } : {}),
+        ...(body.shareOpencodeAuth !== undefined ? { shareOpencodeAuth: body.shareOpencodeAuth } : {}),
       }),
 
     // 切换上游方案（内嵌 ⇄ 伪装）。忙拒（409）与失败回滚都在桥里做，

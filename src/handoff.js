@@ -36,7 +36,7 @@ const CATEGORIES = [
   { native: ['grep'], targets: ['Grep', 'Search'],
     fields: { pattern: 'pattern', path: ['path', 'directory'], include: 'include', output_mode: 'output_mode' } },
   { native: ['skill'], targets: ['Skill'],
-    fields: { name: ['name', 'skill'], skill: ['skill', 'name'], args: ['args', 'arguments'], arguments: ['arguments', 'args'] } },
+    fields: { id: ['skill', 'name', 'id'], name: ['name', 'skill'], skill: ['skill', 'name'], args: ['args', 'arguments'], arguments: ['arguments', 'args'] } },
 ];
 
 /**

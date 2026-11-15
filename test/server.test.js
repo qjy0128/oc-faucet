@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from '../src/server.js';
 import { BridgeError } from '../src/errors.js';
+import { decodeEnvelope } from '../src/envelope.js';
 
 /**
  * server.js 的测试。
@@ -512,6 +513,65 @@ test('上游失败时也会记一行，带上错误代号', async () => {
     const entry = JSON.parse(text.trim().split('\n')[0]);
     assert.equal(entry.status, 504);
     assert.equal(entry.error, 'upstream_timeout');
+  });
+});
+
+test('requests.jsonl 记录信封错误分类，但不记录模型原文或未知诊断字段', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'oc-log-diagnostic-'));
+  let call = 0;
+  const bridge = fakeBridge({
+    complete: async () => {
+      call += 1;
+      if (call === 1) {
+        return decodeEnvelope(
+          '{"calls":[{"name":"private-tool-name","arguments":{"token":"private-argument-value"}}]}',
+          { tools: [{ name: 'read' }] },
+        );
+      }
+      if (call === 2) {
+        throw new BridgeError('private-error-message', 502, 'invalid_tool_call', {
+          reason: 'tool_name_unknown',
+          callIndex: 'private-call-index',
+          toolName: 'private-tool-name',
+        });
+      }
+      if (call === 3) {
+        throw new BridgeError('private-error-message', 502, 'invalid_tool_call', {
+          reason: 'tool_name_unknown',
+          callIndex: Number.POSITIVE_INFINITY,
+        });
+      }
+      throw new BridgeError('private-error-message', 502, 'invalid_tool_call', { reason: 'private-error-reason' });
+    },
+  });
+
+  await withServer({ bridge, protocol: fakeProtocol(), dataDir: dir }, async (base) => {
+    const requestOnce = () =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ model: 'opencode/free-model', messages: [{ role: 'user', content: '你好' }] }),
+      });
+
+    assert.equal((await requestOnce()).status, 502);
+    assert.equal((await requestOnce()).status, 502);
+    assert.equal((await requestOnce()).status, 502);
+    assert.equal((await requestOnce()).status, 502);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const text = await readFile(join(dir, 'requests.jsonl'), 'utf8');
+    const entries = text
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(entries.length, 4);
+    assert.deepEqual(entries[0].diagnostic, { reason: 'tool_name_unknown', callIndex: 1, availableToolCount: 1 });
+    assert.equal(entries[1].diagnostic, undefined, '带未知字段或非允许类型的诊断应整体丢弃');
+    assert.equal(entries[2].diagnostic, undefined, '超出范围的数字应整体丢弃');
+    assert.equal(entries[3].diagnostic, undefined, '未知原因应整体丢弃');
+    for (const secret of ['private-tool-name', 'private-argument-value', 'private-error-message', 'private-call-index']) {
+      assert.ok(!text.includes(secret), `日志不应包含 ${secret}`);
+    }
   });
 });
 

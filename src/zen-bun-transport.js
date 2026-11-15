@@ -207,7 +207,13 @@ export class BunTransport {
         'upstream_unreachable',
       );
     }
-    return new Response(payload.body, { status: payload.status });
+    const responseHeaders = new Headers();
+    if (payload.headers && typeof payload.headers === 'object') {
+      for (const [key, value] of Object.entries(payload.headers)) {
+        if (typeof value === 'string') responseHeaders.set(key, value);
+      }
+    }
+    return new Response(payload.body, { status: payload.status, headers: responseHeaders });
   }
 
   async stop() {

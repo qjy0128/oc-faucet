@@ -43,8 +43,14 @@ const server = Bun.serve({
         body: payload.body,
         signal: AbortSignal.timeout(Number(payload.timeoutMs) || 180_000),
       });
+      const headers = {};
+      for (const name of ['content-type', 'retry-after', 'x-ratelimit-reset-after', 'x-ratelimit-reset', 'x-ratelimit-remaining']) {
+        const value = response.headers.get(name);
+        if (value !== null) headers[name] = value;
+      }
       return Response.json({
         status: response.status,
+        headers,
         body: await response.text(),
       });
     } catch (error) {

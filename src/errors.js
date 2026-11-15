@@ -7,12 +7,14 @@ export class BridgeError extends Error {
    * @param {string} message 给用户看的话
    * @param {number} [status] HTTP 状态码
    * @param {string} [code] 机器可读代号
+   * @param {object} [diagnostic] 供本地日志分类的安全元数据；不能放错误原文或用户数据
    */
-  constructor(message, status = 400, code = 'invalid_request') {
+  constructor(message, status = 400, code = 'invalid_request', diagnostic) {
     super(message);
     this.name = 'BridgeError';
     this.status = status;
     this.code = code;
+    if (diagnostic !== undefined) this.diagnostic = diagnostic;
   }
 }
 

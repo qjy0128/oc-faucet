@@ -6,7 +6,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -103,18 +103,20 @@ test('buildIsolatedEnv：口令和隔离配置不能被 extraEnv 覆盖', () => 
   assert.equal(env.STUB_LOG, '/tmp/x.jsonl', '正常的额外变量要能带进去');
 });
 
-test('buildIsolatedEnv：隔离配置里本机动作一律挂审批，由客户端自动秒拒', () => {
+test('buildIsolatedEnv：隔离配置里全量保留工具表并标 ask，且不覆盖原生系统提示词', () => {
   const env = buildIsolatedEnv({ root: join(tempDir(), 'oc'), baseEnv: {}, password: 'p' });
   const config = JSON.parse(env.OPENCODE_CONFIG_CONTENT);
 
-  // 必须 ask 不能 deny：deny 会让 OpenCode 不把工具表申报给上游，免费池直接 403
-  assert.equal(config.permission['*'], 'ask', '未列出的动作挂审批（由 OcClient 自动拒批），不能 deny');
-  for (const action of ['question', 'websearch', 'codesearch', 'webfetch', 'task', 'todowrite']) {
-    assert.equal(config.permission[action], 'deny', `${action} 必须直接拒掉`);
+  assert.equal(env.OPENCODE_CLIENT, 'desktop');
+  assert.equal(config.permission['*'], 'ask', '未列出的动作挂审批，不能 deny');
+  for (const action of ['question', 'websearch', 'codesearch', 'webfetch', 'subagent', 'task', 'skill', 'execute']) {
+    assert.equal(config.permission[action], 'ask', `${action} 必须保持 ask 以申报完整工具表`);
   }
   assert.equal(config.autoupdate, false);
   assert.equal(config.share, 'disabled');
-  assert.ok(config.agent[ISOLATED_AGENT], '要有我们自己的推理 agent');
+  assert.ok(config.agent[ISOLATED_AGENT], '要有隔离推理 agent');
+  assert.equal(config.agent[ISOLATED_AGENT].prompt, undefined, '不覆盖 OpenCode 原生 system prompt');
+  assert.equal(config.agent[ISOLATED_AGENT].description, undefined);
 });
 
 test('buildIsolatedEnv：缺参数时明确报错，不生成半个环境', () => {
@@ -122,16 +124,21 @@ test('buildIsolatedEnv：缺参数时明确报错，不生成半个环境', () =
   assert.throws(() => buildIsolatedEnv({ root: '/tmp/x', password: '' }), TypeError);
 });
 
-test('ensureRuntimeDirs：config/data/cache/state/project 全建出来，权限 0700', () => {
+test('ensureRuntimeDirs：建出所有目录（0700）并写入 bridge.js 桥接插件', () => {
   const root = join(tempDir(), 'opencode');
   ensureRuntimeDirs(root);
 
-  for (const name of ['config', 'data', 'cache', 'state', 'project']) {
+  for (const name of ['config', 'data', 'cache', 'state', 'project', 'session-systems']) {
     const dir = join(root, name);
     assert.ok(existsSync(dir), `${name} 目录应当存在`);
     // 权限位只取低 9 位比较，避开不同文件系统的额外标记
     assert.equal(statSync(dir).mode & 0o777, 0o700, `${name} 应当是 0700`);
   }
+  const pluginPath = join(root, 'config', 'opencode', 'plugins', 'bridge.js');
+  assert.ok(existsSync(pluginPath), 'bridge.js 插件必须自动生成');
+  const pluginText = readFileSync(pluginPath, 'utf8');
+  assert.match(pluginText, /session\.hook\('context'/);
+  assert.match(pluginText, /execute\.before/);
 });
 
 test('runtimeRoot：拼在数据目录下，参数不对就报错', () => {

@@ -10,14 +10,21 @@
 
 const byId = (id) => document.getElementById(id);
 
-let snapshot = { models: [], phase: 'starting', progress: null };
+let snapshot = { models: [], hiddenModels: [], blockedModels: [], phase: 'starting', progress: null };
 /** 方案切换进行中：两个按钮都先禁用，免得连点 */
 let switchingMode = false;
 let probingAll = false;
 let restarting = false;
 let openRowId = null;
 const testingIds = new Set();
+const blockingIds = new Set();
 const contextWindowDrafts = new Map();
+let hiddenExpanded = false;
+let opencodeInstallPromptShown = false;
+let opencodeWarningDismissed = false;
+let lastOpencodeInstalled = null;
+let lastOpencodeExternalRunning = null;
+let checkingOpencode = false;
 // 目标勾选区：当前展开的是哪个目标、勾了哪些模型（轮询重画时要保住）
 let openTargetPickerId = null;
 const targetPickerDraft = new Map();
@@ -25,6 +32,7 @@ const actionVersions = new Map();
 const noticeErrors = new Map();
 let noticeSequence = 0;
 let transientNotice = null;
+let currentNoticeScope = null;
 let latestStateRequest = 0;
 let stateRevision = 0;
 let webDisconnected = false;
@@ -106,6 +114,16 @@ function verdictText(model) {
 }
 
 const usable = (model) => model.verdict === 'tool' || model.verdict === 'chat';
+
+function isServiceReadySnapshot(next = snapshot) {
+  if (!next || typeof next !== 'object') return false;
+  return next.phase === 'ready' && !next.error && !next.errorCode && next.upstream?.ready !== false;
+}
+
+function isUpstreamNotReadyMessage(message) {
+  const text = String(message ?? '');
+  return /还没起来|尚未启动|未就绪|正在启动|正在重启|已停止|意外退出|已断开|not_ready|upstream_not_ready|runtime_missing|upstream_disconnected|probe_busy|context_window_busy/i.test(text);
+}
 
 function humanMs(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return '';
@@ -207,20 +225,46 @@ let noteTimer = null;
 function beginAction(scope) {
   const version = (actionVersions.get(scope) ?? 0) + 1;
   actionVersions.set(scope, version);
-  return { scope, version, startedAt: Date.now() };
+  return {
+    scope,
+    version,
+    startedAt: Date.now(),
+    startedWhenReady: isServiceReadySnapshot(snapshot),
+  };
 }
 
 function renderNotice() {
+  const bar = byId('notice-bar');
   const node = byId('notice');
-  const latestError = [...noticeErrors.values()].sort((a, b) => b.sequence - a.sequence)[0];
-  const visible = latestError ?? transientNotice;
+  const dismiss = byId('notice-dismiss');
+  const latestEntry = [...noticeErrors.entries()].sort((a, b) => b[1].sequence - a[1].sequence)[0];
+  const visible = latestEntry ? latestEntry[1] : transientNotice;
+  currentNoticeScope = latestEntry ? latestEntry[0] : null;
   if (!visible) {
+    bar.hidden = true;
     node.hidden = true;
+    node.className = 'notice';
+    node.textContent = '';
+    dismiss.hidden = true;
     return;
   }
   node.textContent = visible.message;
   node.className = `notice${visible.kind ? ` is-${visible.kind}` : ''}`;
+  bar.hidden = false;
   node.hidden = false;
+  dismiss.hidden = false;
+}
+
+function dismissNotice() {
+  if (currentNoticeScope) {
+    noticeErrors.delete(currentNoticeScope);
+    currentNoticeScope = null;
+  } else {
+    clearTimeout(noteTimer);
+    noteTimer = null;
+    transientNotice = null;
+  }
+  renderNotice();
 }
 
 /** 错误按动作归属；成功只清该动作的旧错误，旧请求结果不能盖过新操作。 */
@@ -239,10 +283,17 @@ function note(message, kind = '', action = null) {
 
   if (kind === 'error' || kind === 'warning') {
     const scope = action?.scope ?? 'global';
+    const upstreamNotReady = isUpstreamNotReadyMessage(message);
+    const missingUsableModels = /还没有可用的模型|至少要选一个可用模型/.test(String(message ?? ''));
     noticeErrors.set(scope, {
       message,
       kind,
       startedAt: action?.startedAt ?? Date.now(),
+      upstreamNotReady,
+      missingUsableModels,
+      targetLanAccess: action?.targetLanAccess,
+      targetMode: action?.targetMode,
+      hadWritten: action?.hadWritten,
       modelBaselines: action?.modelBaselines ? new Map(action.modelBaselines) : null,
       failedModelIds: action?.failedModelIds ? new Set(action.failedModelIds) : new Set(),
       expectedFailed: Number(action?.expectedFailed) || 0,
@@ -549,6 +600,14 @@ function renderList() {
       tags.append(t);
     }
     if (!tags.childElementCount) tags.append(h('span', 'tag-none', '仅文本'));
+    if (Number.isFinite(model.cooldownUntil) && model.cooldownUntil > Date.now()) {
+      const mins = Math.max(1, Math.ceil((model.cooldownUntil - Date.now()) / 60000));
+      const coolTag = h('span', 'tag tag-cool', `冷却 ${mins} 分`);
+      coolTag.title = model.cooldownReason
+        ? `上游限流/异常保护冷却中：${model.cooldownReason}`
+        : '上游限流/异常保护冷却中，到期前自动在本地熔断';
+      tags.append(coolTag);
+    }
 
     // 状态
     const state = h('span', 'state');
@@ -558,7 +617,20 @@ function renderList() {
     // 耗时
     const timing = h('span', 'timing', timingText(model));
 
-    main.append(retest, cell, tags, state, timing);
+    // 操作：按模型 ID 屏蔽并隐藏（需二次确认）
+    const ops = h('div', 'row-ops');
+    const blockBtn = h('button', 'mini row-block-btn', blockingIds.has(model.id) ? '屏蔽中…' : '屏蔽');
+    blockBtn.type = 'button';
+    blockBtn.title = `屏蔽并隐藏 ${model.id}`;
+    blockBtn.setAttribute('aria-label', `屏蔽 ${model.name}`);
+    blockBtn.disabled = blockingIds.has(model.id);
+    blockBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      return blockModelById(model.id, model.name);
+    });
+    ops.append(blockBtn);
+
+    main.append(retest, cell, tags, state, timing, ops);
     row.append(main);
 
     if (open) row.append(detailBlock(model));
@@ -634,7 +706,14 @@ function detailBlock(model) {
     event.stopPropagation();
     retestOne(model.id);
   });
-  tools.append(again);
+  const blockDetail = h('button', 'btn-danger-ghost', blockingIds.has(model.id) ? '屏蔽中…' : '屏蔽此模型');
+  blockDetail.type = 'button';
+  blockDetail.disabled = blockingIds.has(model.id);
+  blockDetail.addEventListener('click', (event) => {
+    event.stopPropagation();
+    return blockModelById(model.id, model.name);
+  });
+  tools.append(again, blockDetail);
   wrap.append(tools);
 
   return wrap;
@@ -816,8 +895,12 @@ function emptyBlock() {
 
   if (snapshot.error) {
     box.append(h('h3', '', '模型服务没起来'), h('p', '', '看底部的错误信息，处理完再刷新这个页面。'));
+  } else if (snapshot.phase === 'ready' && (snapshot.hiddenModels?.length ?? 0) > 0) {
+    box.append(h('h3', '', '模型已全部隐藏'), h('p', '', '可在列表最下方的「隐藏的模型」中展开并恢复显示。'));
   } else if (snapshot.phase === 'ready') {
     box.append(h('h3', '', '没找到免费模型'), h('p', '', '点上面的「读取模型」重新拉一次目录。'));
+  } else if (snapshot.phase === 'idle') {
+    box.append(h('h3', '', '模型服务已停止'), h('p', '', '点底部「启动服务」重新运行。'));
   } else {
     const detail = snapshot.mode === 'masquerade'
       ? '伪装方案准备好后，模型会出现在这里。'
@@ -825,6 +908,114 @@ function emptyBlock() {
     box.append(h('h3', '', '正在准备模型服务'), h('p', '', detail));
   }
   return box;
+}
+
+/** 渲染列表底部的可折叠「隐藏的模型」区域 */
+function renderHiddenList() {
+  const hiddenModels = Array.isArray(snapshot.hiddenModels) ? snapshot.hiddenModels : [];
+  const count = hiddenModels.length;
+
+  byId('hidden-toggle-label').textContent = `隐藏的模型 (${count})`;
+  byId('hidden-toggle-hint').textContent = hiddenExpanded ? '点击收起' : count ? '点击展开或恢复' : '点击可按 ID 屏蔽';
+  byId('hidden-toggle').setAttribute('aria-expanded', String(hiddenExpanded));
+
+  const panel = byId('hidden-panel');
+  panel.hidden = !hiddenExpanded;
+  if (!hiddenExpanded) return;
+
+  const box = byId('hidden-rows');
+  const frag = document.createDocumentFragment();
+  if (!count) {
+    frag.append(h('div', 'hidden-empty', '当前没有被屏蔽的模型；可在上方输入模型 ID 或在模型列表右侧点「屏蔽」。'));
+  } else {
+    const sorted = [...hiddenModels].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+    for (const model of sorted) {
+      const item = h('div', 'hidden-item');
+      const meta = h('div', 'hidden-item-meta');
+      meta.append(
+        h('span', 'hidden-item-name', model.name || model.id),
+        h('span', 'hidden-item-id', model.inCatalog === false ? `${model.id}（手动规则 · 当前目录未返回）` : model.id),
+      );
+      const restore = h('button', 'mini', blockingIds.has(model.id) ? '恢复中…' : '恢复显示');
+      restore.type = 'button';
+      restore.disabled = blockingIds.has(model.id);
+      restore.addEventListener('click', () => unblockModelById(model.id));
+      item.append(meta, restore);
+      frag.append(item);
+    }
+  }
+  box.replaceChildren(frag);
+}
+
+/** 渲染顶部 OpenCode 安装与运行状态提示，并在首次未安装时弹窗指引 */
+function renderOpencodeBanner() {
+  const banner = byId('opencode-banner');
+  const title = byId('opencode-banner-title');
+  const desc = byId('opencode-banner-desc');
+  const installBtn = byId('opencode-banner-install');
+  const switchBtn = byId('opencode-banner-switch');
+  const retryBtn = byId('opencode-banner-retry');
+  const dismissBtn = byId('opencode-banner-dismiss');
+
+  const oc = snapshot.opencode;
+  if (!oc || typeof oc !== 'object') {
+    banner.hidden = true;
+    return;
+  }
+
+  const installed = oc.installed === true;
+  const externalRunning = oc.externalRunning === true;
+  if (lastOpencodeInstalled === false && installed) {
+    const dialog = byId('opencode-install-dialog');
+    if (dialog.open || dialog.hasAttribute?.('open')) closeModal(dialog);
+  }
+  if (lastOpencodeExternalRunning === false && externalRunning) {
+    opencodeWarningDismissed = false;
+  }
+  lastOpencodeInstalled = installed;
+  lastOpencodeExternalRunning = externalRunning;
+
+  retryBtn.disabled = checkingOpencode;
+  retryBtn.textContent = checkingOpencode ? '检测中…' : '重新检测';
+
+  if (!installed) {
+    banner.className = 'opencode-banner is-error';
+    banner.hidden = false;
+    title.textContent = '未检测到本机 OpenCode';
+    desc.textContent = snapshot.mode === 'masquerade'
+      ? `未在本机找到 OpenCode（桌面端或 CLI）。当前正在使用「伪装」方案；如需使用「内嵌」方案，请安装 OpenCode（${oc.installUrl || 'https://opencode.ai'}）。`
+      : '未在本机找到 OpenCode（桌面端或 CLI）。内嵌方案需要依赖 OpenCode 运行；请安装后点「重新检测」，或切换到「伪装」方案直接使用。';
+    installBtn.hidden = false;
+    switchBtn.hidden = snapshot.mode === 'masquerade';
+    dismissBtn.hidden = true;
+
+    if (!opencodeInstallPromptShown && snapshot.mode !== 'masquerade') {
+      opencodeInstallPromptShown = true;
+      openModal(byId('opencode-install-dialog'));
+    }
+    return;
+  }
+
+  if (!externalRunning) {
+    if (opencodeWarningDismissed) {
+      banner.hidden = true;
+      return;
+    }
+    banner.className = 'opencode-banner is-warning';
+    banner.hidden = false;
+    title.textContent = '已安装 OpenCode，但外部 OpenCode 客户端当前未打开';
+    desc.textContent = snapshot.mode === 'masquerade'
+      ? '本机已安装 OpenCode，但当前未检测到外部 OpenCode 客户端在运行（伪装方案可直接转发）。如需对照使用或检查登录状态，可先打开 OpenCode 再点「重新检测」。'
+      : isServiceReadySnapshot(snapshot)
+        ? 'OC Faucet 内部隔离实例已就绪，但当前未检测到外部 OpenCode 客户端处于打开状态；建议启动一次 OpenCode 客户端后再点「重新检测」。'
+        : '本机已安装 OpenCode，但外部 OpenCode 客户端尚未打开，且当前内置服务还未就绪；可打开 OpenCode 或等待服务就绪。';
+    installBtn.hidden = true;
+    switchBtn.hidden = true;
+    dismissBtn.hidden = false;
+    return;
+  }
+
+  banner.hidden = true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1051,37 +1242,127 @@ function targetPicker(target, usableCount, locked) {
 }
 
 function render() {
+  renderOpencodeBanner();
   renderTop();
   renderActions();
   renderList();
+  renderHiddenList();
   renderTargets();
   renderStatus();
   renderMode();
   renderLan();
 }
 
-/** 状态快照是某次模型判定成功的唯一可靠信号；旧快照不能清除新错误。 */
-function applySnapshot(next) {
-  if (!next || typeof next !== 'object') return false;
+/** 根据新状态清除已经恢复或不再适用的错误提示，避免弹窗/横幅一直卡着不消失。 */
+function reconcileNoticeErrors(next) {
+  const nextModels = Array.isArray(next.models) ? next.models : [];
+  const hiddenModels = Array.isArray(next.hiddenModels) ? next.hiddenModels : [];
+  const visibleIds = new Set(nextModels.map((item) => item?.id).filter(Boolean));
+  const hiddenIds = new Set(hiddenModels.map((item) => item?.id).filter(Boolean));
+  const serviceReady = isServiceReadySnapshot(next);
 
-  for (const [scope, failure] of noticeErrors) {
-    if (!scope.startsWith('probe:model:')) continue;
-    const modelId = scope.slice('probe:model:'.length);
-    const model = (next.models ?? []).find((item) => item.id === modelId);
-    if (model && usable(model) && Number.isFinite(model.checkedAt) && model.checkedAt > failure.startedAt) {
+  for (const [scope, failure] of [...noticeErrors.entries()]) {
+    if (scope.startsWith('probe:model:')) {
+      const modelId = scope.slice('probe:model:'.length);
+      const model = nextModels.find((item) => item.id === modelId);
+      const blockedOrRemoved = hiddenIds.has(modelId) || (next.phase === 'ready' && nextModels.length > 0 && !visibleIds.has(modelId));
+      const upgraded = Boolean(model && usable(model) && Number.isFinite(model.checkedAt) && model.checkedAt > failure.startedAt);
+      if (blockedOrRemoved || (failure.upstreamNotReady && serviceReady) || upgraded) {
+        clearNotice(scope);
+      }
+      continue;
+    }
+
+    if (scope.startsWith('context-window:')) {
+      const modelId = scope.slice('context-window:'.length);
+      if (hiddenIds.has(modelId) || (failure.upstreamNotReady && serviceReady)) {
+        clearNotice(scope);
+      }
+      continue;
+    }
+
+    if (scope === 'models:refresh') {
+      if (serviceReady && (failure.upstreamNotReady || nextModels.length > 0)) {
+        clearNotice(scope);
+      }
+      continue;
+    }
+
+    if (scope === 'service:restart') {
+      if (serviceReady) clearNotice(scope);
+      continue;
+    }
+
+    if (scope === 'service:stop') {
+      if (next.phase === 'idle' || serviceReady) clearNotice(scope);
+      continue;
+    }
+
+    if (scope === 'service:mode-switch') {
+      if (serviceReady && (!failure.targetMode || next.mode === failure.targetMode)) {
+        clearNotice(scope);
+      }
+      continue;
+    }
+
+    if (scope === 'network:lan-access') {
+      if ((typeof failure.targetLanAccess === 'boolean' && next.lanAccess === failure.targetLanAccess)
+        || (failure.upstreamNotReady && serviceReady)) {
+        clearNotice(scope);
+      }
+      continue;
+    }
+
+    if (scope.startsWith('target:install:')) {
+      const targetId = scope.slice('target:install:'.length);
+      const target = Array.isArray(next.targets) ? next.targets.find((item) => item.id === targetId) : null;
+      if ((failure.upstreamNotReady && serviceReady)
+        || (failure.missingUsableModels && nextModels.some(usable))
+        || (!failure.hadWritten && target?.written === true)) {
+        clearNotice(scope);
+      }
+      continue;
+    }
+
+    if (scope.startsWith('target:uninstall:')) {
+      const targetId = scope.slice('target:uninstall:'.length);
+      const target = Array.isArray(next.targets) ? next.targets.find((item) => item.id === targetId) : null;
+      if ((failure.upstreamNotReady && serviceReady) || (failure.hadWritten && target && target.written === false)) {
+        clearNotice(scope);
+      }
+      continue;
+    }
+
+    if (scope === 'probe:all') {
+      if ((failure.upstreamNotReady && serviceReady) || (failure.expectedFailed === 0 && serviceReady && nextModels.some(usable))) {
+        clearNotice('probe:all');
+      }
+      continue;
+    }
+
+    if (scope !== 'connection:web' && !scope.startsWith('service:mode-pending:') && failure.upstreamNotReady && serviceReady) {
       clearNotice(scope);
     }
   }
 
   const aggregate = noticeErrors.get('probe:all');
   if (aggregate?.expectedFailed > 0) {
-    const models = Array.isArray(next.models) ? next.models : [];
-    for (const model of models) {
+    for (const model of nextModels) {
       if (model?.verdict === 'failed') aggregate.failedModelIds.add(model.id);
+    }
+    let blockedRemoved = 0;
+    for (const modelId of [...aggregate.failedModelIds]) {
+      if (hiddenIds.has(modelId)) {
+        aggregate.failedModelIds.delete(modelId);
+        blockedRemoved += 1;
+      }
+    }
+    if (blockedRemoved > 0) {
+      aggregate.expectedFailed = Math.max(0, aggregate.expectedFailed - blockedRemoved);
     }
     let recoveredNow = 0;
     for (const modelId of [...aggregate.failedModelIds]) {
-      const model = models.find((item) => item.id === modelId);
+      const model = nextModels.find((item) => item.id === modelId);
       if (!model) continue;
       const baseline = aggregate.modelBaselines?.get(modelId);
       const newerCheck = Number.isFinite(model.checkedAt) && (!baseline || !Number.isFinite(baseline.checkedAt) || model.checkedAt > baseline.checkedAt);
@@ -1096,14 +1377,23 @@ function applySnapshot(next) {
     }
     if (aggregate.failedModelIds.size === 0 && aggregate.recoveredCount >= aggregate.expectedFailed) {
       clearNotice('probe:all');
-    } else if (recoveredNow > 0) {
+    } else if (recoveredNow > 0 || blockedRemoved > 0) {
       const remaining = Math.max(aggregate.failedModelIds.size, aggregate.expectedFailed - aggregate.recoveredCount);
-      aggregate.message = `检测结果已更新：${aggregate.recoveredCount} 个模型已恢复，仍有 ${remaining} 个不可用。`;
+      aggregate.message = aggregate.recoveredCount > 0
+        ? `检测结果已更新：${aggregate.recoveredCount} 个模型已恢复，仍有 ${remaining} 个不可用。`
+        : `检测结果已更新：仍有 ${remaining} 个模型不可用。`;
       aggregate.kind = 'warning';
       aggregate.sequence = ++noticeSequence;
       renderNotice();
     }
   }
+}
+
+/** 状态快照是某次模型判定成功的唯一可靠信号；旧快照不能清除新错误。 */
+function applySnapshot(next) {
+  if (!next || typeof next !== 'object') return false;
+
+  reconcileNoticeErrors(next);
 
   clearNotice('state:refresh');
   if (window.oc.panelShell === 'web') {
@@ -1245,9 +1535,115 @@ async function retestOne(id) {
   }
 }
 
+async function blockModelById(rawId, displayName = '') {
+  const id = String(rawId ?? '').trim();
+  if (!id) {
+    note('请输入要屏蔽的模型 ID（例如 opencode/glm-5.3-flash-free）。', 'error', beginAction('models:block'));
+    return false;
+  }
+  if (/\s/.test(id)) {
+    note('模型 ID 不能包含空格。', 'error', beginAction('models:block'));
+    return false;
+  }
+  const label = displayName && displayName !== id ? `${displayName}（${id}）` : id;
+  const yes = window.confirm(
+    `确定要屏蔽并隐藏模型「${label}」吗？\n\n屏蔽后该模型将从列表隐藏，后续重新读取模型目录时也会自动隐藏，并从转发目录与已写入工具配置中移除。你随时可以在列表最下方的「隐藏的模型」中恢复显示。`,
+  );
+  if (!yes) return false;
+  if (blockingIds.has(id)) return false;
+
+  const action = beginAction(`models:block:${id}`);
+  blockingIds.add(id);
+  renderList();
+  renderHiddenList();
+  try {
+    const result = await call('屏蔽模型', () => window.oc.setModelBlocked(id, true), action);
+    if (!result) return false;
+    if (openRowId === id) openRowId = null;
+    clearNotice(`probe:model:${id}`);
+    clearNotice(`context-window:${id}`);
+    byId('hidden-id-input').value = '';
+    clearNotice('models:block');
+    note(`已屏蔽并隐藏模型 ${result.id ?? id}`, 'ok', action);
+    await refreshSnapshot();
+    return true;
+  } finally {
+    blockingIds.delete(id);
+    renderList();
+    renderHiddenList();
+  }
+}
+
+async function unblockModelById(id) {
+  const normalized = String(id ?? '').trim();
+  if (!normalized || blockingIds.has(normalized)) return false;
+  const action = beginAction(`models:unblock:${normalized}`);
+  blockingIds.add(normalized);
+  renderHiddenList();
+  try {
+    const result = await call('恢复显示', () => window.oc.setModelBlocked(normalized, false), action);
+    if (!result) return false;
+    note(`已恢复显示模型 ${normalized}`, 'ok', action);
+    await refreshSnapshot();
+    return true;
+  } finally {
+    blockingIds.delete(normalized);
+    renderList();
+    renderHiddenList();
+  }
+}
+
+async function checkOpencodeNow() {
+  if (checkingOpencode || typeof window.oc.checkOpencodeEnv !== 'function') return null;
+  const action = beginAction('opencode:check');
+  checkingOpencode = true;
+  renderOpencodeBanner();
+  try {
+    const status = await call('检测 OpenCode 状态', () => window.oc.checkOpencodeEnv(), action);
+    if (!status) return null;
+    if (status.installed) {
+      const dialog = byId('opencode-install-dialog');
+      if (dialog.open || dialog.hasAttribute?.('open')) closeModal(dialog);
+      opencodeWarningDismissed = false;
+    }
+    await refreshSnapshot();
+    if (!status.installed) {
+      note(`仍未检测到本机 OpenCode，请访问 ${status.installUrl || 'https://opencode.ai'} 安装或切换伪装方案。`, 'warning', action);
+    } else if (status.externalRunning) {
+      note('已检测到本机 OpenCode 已安装并处于运行状态。', 'ok', action);
+    } else if (snapshot.errorCode === 'runtime_missing') {
+      note('已检测到本机 OpenCode 安装，点下方「重试服务」即可启动。', 'ok', action);
+    } else {
+      note('已检测到 OpenCode 安装，但外部 OpenCode 客户端尚未打开。', 'ok', action);
+    }
+    return status;
+  } finally {
+    checkingOpencode = false;
+    renderOpencodeBanner();
+  }
+}
+
+async function openOpencodeInstall() {
+  const action = beginAction('opencode:install');
+  const result = typeof window.oc.openOpencodeInstall === 'function'
+    ? await call('打开 OpenCode 官网', () => window.oc.openOpencodeInstall(), action)
+    : { url: 'https://opencode.ai', opened: false };
+  if (!result) return;
+  const url = result.url || 'https://opencode.ai';
+  if (result.opened === false) {
+    const openedPopup = typeof window.open === 'function' ? window.open(url, '_blank', 'noopener,noreferrer') : null;
+    if (!openedPopup) {
+      note(`请在浏览器打开安装页面：${url}`, 'ok', action);
+      return;
+    }
+  }
+  note(`已打开 OpenCode 官方安装页面：${url}`, 'ok', action);
+}
+
 /** 写入提示：写入了几个、有让位的（撞了用户手写条目）要说一声 */
 async function installTarget(target, modelIds) {
   const action = beginAction(`target:install:${target.id}`);
+  action.hadWritten = target?.written === true;
   const result = await call('写入', () => window.oc.installTarget(target.id, modelIds), action);
   if (!result) return;
   openTargetPickerId = null;
@@ -1273,6 +1669,7 @@ async function uninstallTarget(target) {
   );
   if (!yes) return;
   const action = beginAction(`target:uninstall:${target.id}`);
+  action.hadWritten = target?.written === true;
   const result = await call('移除', () => window.oc.uninstallTarget(target.id), action);
   if (!result) return;
   note(`已从 ${target.label} 移除 ${result.removed ?? 0} 个模型`, 'ok', action);
@@ -1284,6 +1681,7 @@ async function switchUpstreamMode(mode) {
   if (switchingMode) return;
   if ((snapshot.mode === 'masquerade' ? 'masquerade' : 'embedded') === mode) return;
   const action = beginAction('service:mode-switch');
+  action.targetMode = mode;
   switchingMode = true;
   renderMode();
   note(mode === 'masquerade' ? '正在切换到伪装方案（启动 Bun 侧车）…' : '正在切换到内嵌方案…', '', action);
@@ -1313,6 +1711,7 @@ async function switchUpstreamMode(mode) {
 async function toggleLanAccess() {
   const action = beginAction('network:lan-access');
   const enable = !(snapshot.lanAccess === true);
+  action.targetLanAccess = enable;
   note(enable ? '正在开启路由器广播…' : '正在关闭路由器广播…', '', action);
   const result = await call('切换局域网访问', () => window.oc.setLanAccess(enable), action);
   await refreshSnapshot();
@@ -1445,6 +1844,10 @@ async function loadSettings() {
   byId('cfg-ttl').value = s.probeTtlMinutes;
   byId('cfg-concurrency').setAttribute('aria-invalid', 'false');
   byId('cfg-ttl').setAttribute('aria-invalid', 'false');
+  const capInput = byId('cfg-context-cap');
+  capInput.value = s.targetContextCap ?? 0;
+  capInput.setAttribute('aria-invalid', 'false');
+  byId('cfg-share-auth').checked = Boolean(s.shareOpencodeAuth);
   note('', 'ok', action);
 }
 
@@ -1471,11 +1874,74 @@ async function saveSettings() {
 
   const saved = await call('保存设置', () => window.oc.saveSettings({ probeConcurrency, probeTtlMinutes }), action);
   if (!saved) return;
+  clearNotice('settings:read');
   if (Number.isInteger(saved.probeConcurrency)) concurrencyInput.value = saved.probeConcurrency;
   if (Number.isFinite(saved.probeTtlMinutes) && saved.probeTtlMinutes > 0) ttlInput.value = saved.probeTtlMinutes;
   concurrencyInput.setAttribute('aria-invalid', 'false');
   ttlInput.setAttribute('aria-invalid', 'false');
   note('设置已保存', 'ok', action);
+}
+
+async function saveContextCap() {
+  const capInput = byId('cfg-context-cap');
+  const raw = String(capInput.value ?? '').trim();
+  const num = raw === '' ? 0 : Number(raw);
+  const invalid = raw !== '' && (!Number.isInteger(num) || (num !== 0 && (num < 1024 || num > 10000000)));
+  const action = beginAction('settings:cap');
+
+  capInput.setAttribute('aria-invalid', String(invalid));
+  if (invalid) {
+    note('客户端上下文上限无效：请填写 0（不限制）或 1024–10000000 的整数。', 'error', action);
+    return;
+  }
+
+  const saved = await call('保存客户端上下文上限', () => window.oc.saveSettings({ targetContextCap: num === 0 ? null : num }), action);
+  if (!saved) return;
+  clearNotice('settings:read');
+  capInput.value = saved.targetContextCap ?? 0;
+  capInput.setAttribute('aria-invalid', 'false');
+  note(
+    saved.targetContextCap
+      ? `客户端上下文上限已设为 ${saved.targetContextCap}（后续写入或重载目标配置生效）`
+      : '已取消客户端上下文上限限制',
+    'ok',
+    action
+  );
+  await refreshSnapshot();
+}
+
+async function toggleShareAuth() {
+  const checkbox = byId('cfg-share-auth');
+  const next = Boolean(checkbox.checked);
+  const action = beginAction('settings:share-auth');
+  if (next && typeof window.confirm === 'function') {
+    const yes = window.confirm(
+      '确认开启「复用本机 OpenCode 登录态」吗？\n\n' +
+      '开启后仅从本机 OpenCode 认证中同步 opencode 官方通道账号（绝不读取或复制任何第三方付费 API Key）。\n' +
+      '提示：与本机共享账号后会按同一账号统计免费额度，部分场景需要“重启”服务后完全生效。'
+    );
+    if (!yes) {
+      checkbox.checked = false;
+      note('已取消开启登录态复用', '', action);
+      return;
+    }
+  }
+  const saved = await call('保存登录态共享设置', () => window.oc.saveSettings({ shareOpencodeAuth: next }), action);
+  if (!saved) {
+    checkbox.checked = !next;
+    return;
+  }
+  clearNotice('settings:read');
+  const active = Boolean(saved.shareOpencodeAuth);
+  checkbox.checked = active;
+  const needsRestart = snapshot.mode === 'embedded' && snapshot.phase === 'ready';
+  note(
+    active
+      ? (needsRestart ? '已开启复用本机 OpenCode 登录态（仅 opencode 账号）；内嵌模式请点顶部“重启”后生效' : '已开启复用本机 OpenCode 登录态（仅 opencode 账号）')
+      : (needsRestart ? '已关闭登录态复用并恢复隔离；内嵌模式请点顶部“重启”后生效' : '已关闭登录态复用并恢复隔离'),
+    'ok',
+    action
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -1621,6 +2087,12 @@ function renderUpdateDialog(state) {
 function receiveUpdateState(state) {
   if (!state || typeof state !== 'object') return;
   updateState = state;
+  if (state.status !== 'error') {
+    clearNotice('update:download');
+  }
+  if (state.status === 'available' || state.status === 'up-to-date' || state.status === 'ready') {
+    clearNotice('update:check');
+  }
   const version = byId('app-version');
   if (state.currentVersion) version.textContent = `版本 ${state.currentVersion}`;
   renderUpdateDialog(state);
@@ -1649,6 +2121,8 @@ async function checkForUpdates() {
 function wireUpdate() {
   byId('update-later').addEventListener('click', () => {
     byId('update-later').textContent = '稍后再说';
+    byId('update-error').hidden = true;
+    clearNotice('update:download');
     closeUpdateDialog();
   });
   byId('update-confirm').addEventListener('click', startUpdateDownload);
@@ -1668,6 +2142,8 @@ function wireUpdate() {
     // Esc / 点击背景关闭弹窗：下载不被打断，状态推送来了会照常更新
     event.preventDefault();
     byId('update-later').textContent = '稍后再说';
+    byId('update-error').hidden = true;
+    clearNotice('update:download');
     closeUpdateDialog();
   });
   byId('act-check-update').addEventListener('click', checkForUpdates);
@@ -1693,6 +2169,35 @@ function wire() {
   byId('act-read').addEventListener('click', readModels);
   byId('act-test').addEventListener('click', () => testAll(false));
   byId('act-retest').addEventListener('click', () => testAll(true));
+  byId('notice-dismiss').addEventListener('click', dismissNotice);
+  byId('hidden-toggle').addEventListener('click', () => {
+    hiddenExpanded = !hiddenExpanded;
+    renderHiddenList();
+  });
+  byId('hidden-add-btn').addEventListener('click', () => blockModelById(byId('hidden-id-input').value));
+  byId('hidden-id-input').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') return blockModelById(byId('hidden-id-input').value);
+  });
+  byId('opencode-banner-install').addEventListener('click', openOpencodeInstall);
+  byId('opencode-banner-switch').addEventListener('click', () => switchUpstreamMode('masquerade'));
+  byId('opencode-banner-retry').addEventListener('click', checkOpencodeNow);
+  byId('opencode-banner-dismiss').addEventListener('click', () => {
+    opencodeWarningDismissed = true;
+    renderOpencodeBanner();
+  });
+  byId('opencode-install-open').addEventListener('click', openOpencodeInstall);
+  byId('opencode-install-retry').addEventListener('click', checkOpencodeNow);
+  byId('opencode-install-switch').addEventListener('click', async () => {
+    closeModal(byId('opencode-install-dialog'));
+    await switchUpstreamMode('masquerade');
+  });
+  byId('opencode-install-later').addEventListener('click', () => {
+    closeModal(byId('opencode-install-dialog'));
+  });
+  byId('opencode-install-dialog').addEventListener('cancel', (event) => {
+    event.preventDefault();
+    closeModal(byId('opencode-install-dialog'));
+  });
   byId('act-config-path').addEventListener('click', () => whereIs('config'));
   byId('act-log-path').addEventListener('click', () => whereIs('log'));
   byId('act-restart').addEventListener('click', restartService);
@@ -1701,8 +2206,23 @@ function wire() {
   byId('mode-masquerade').addEventListener('click', () => switchUpstreamMode('masquerade'));
   byId('act-lan').addEventListener('click', toggleLanAccess);
   byId('act-lan-info').addEventListener('click', showLanConfig);
-  byId('lan-close').addEventListener('click', () => closeModal(byId('lan-dialog')));
+  byId('lan-close').addEventListener('click', () => {
+    clearNotice('network:lan-info');
+    closeModal(byId('lan-dialog'));
+  });
   byId('cfg-save').addEventListener('click', saveSettings);
+  for (const cfgId of ['cfg-concurrency', 'cfg-ttl']) {
+    byId(cfgId).addEventListener('input', (event) => {
+      event.currentTarget.setAttribute('aria-invalid', 'false');
+      clearNotice('settings:save');
+    });
+  }
+  byId('cfg-cap-save').addEventListener('click', saveContextCap);
+  byId('cfg-context-cap').addEventListener('input', (event) => {
+    event.currentTarget.setAttribute('aria-invalid', 'false');
+    clearNotice('settings:cap');
+  });
+  byId('cfg-share-auth').addEventListener('change', toggleShareAuth);
 
   // 状态栏的 BaseURL 复制；转发口没起来时按钮是灰的，走不到这里
   byId('act-copy-endpoint').addEventListener('click', async (event) => {
@@ -1727,12 +2247,14 @@ function wire() {
   byId('act-key-save').addEventListener('click', saveApiKey);
   byId('act-key-cancel').addEventListener('click', () => {
     keyEditing = false;
+    clearNotice('key:save');
     renderKey();
   });
   byId('key-input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter') saveApiKey();
     if (event.key === 'Escape') {
       keyEditing = false;
+      clearNotice('key:save');
       renderKey();
     }
   });

@@ -232,6 +232,13 @@ test('decodeEnvelope 拒绝：顶层摊平的 tool_calls', () => {
   );
   assert.equal(error.status, 502);
   assert.equal(error.code, 'invalid_model_output');
+  assert.deepEqual(error.diagnostic, {
+    reason: 'envelope_flattened_tool_call',
+    hasName: false,
+    hasArguments: false,
+    hasToolCalls: true,
+    hasFunction: false,
+  });
   assert.match(error.message, /tool_calls/);
 });
 
@@ -252,6 +259,7 @@ test('decodeEnvelope 拒绝：不是 JSON', () => {
   const error = throwsBridge(() => decodeEnvelope('我想读一下 a.txt 这个文件。', request()));
   assert.equal(error.status, 502);
   assert.equal(error.code, 'invalid_model_output');
+  assert.deepEqual(error.diagnostic, { reason: 'envelope_json_invalid' });
   assert.match(error.message, /不是合法的 JSON/);
 });
 
@@ -284,6 +292,7 @@ test('decodeEnvelope 拒绝：arguments 是解不开的字符串', () => {
   const error = throwsBridge(() => decodeEnvelope('{"content":"","calls":[{"name":"read","arguments":"{path: a.txt"}]}', request()));
   assert.equal(error.status, 502);
   assert.equal(error.code, 'invalid_tool_call');
+  assert.deepEqual(error.diagnostic, { reason: 'tool_arguments_json_invalid', callIndex: 1 });
   assert.match(error.message, /不是合法的 JSON/);
 });
 
@@ -297,6 +306,7 @@ test('decodeEnvelope 拒绝：工具不在本次清单里（含相近名字）',
   const error = throwsBridge(() => decodeEnvelope('{"calls":[{"name":"Read","arguments":{"path":"a.txt"}}]}', request()));
   assert.equal(error.status, 502);
   assert.equal(error.code, 'invalid_tool_call');
+  assert.deepEqual(error.diagnostic, { reason: 'tool_name_unknown', callIndex: 1, availableToolCount: 2 });
   assert.match(error.message, /没有提供的工具「Read」/);
   assert.match(error.message, /read/); // 错误信息里要列出可用工具
 });
@@ -314,6 +324,7 @@ test('decodeEnvelope 拒绝：tool_choice=none 时模型还是调了工具', () 
   const error = throwsBridge(() => decodeEnvelope('{"content":"","calls":[{"name":"read","arguments":{}}]}', request({ choice: 'none' })));
   assert.equal(error.status, 502);
   assert.equal(error.code, 'invalid_tool_call');
+  assert.deepEqual(error.diagnostic, { reason: 'tool_choice_none_violated', callCount: 1, toolChoice: 'none' });
   assert.match(error.message, /不允许调用工具/);
 });
 
@@ -347,6 +358,7 @@ test('decodeEnvelope 拒绝：parallel=false 时返回多个调用', () => {
   );
   assert.equal(error.status, 502);
   assert.equal(error.code, 'invalid_tool_call');
+  assert.deepEqual(error.diagnostic, { reason: 'parallel_tool_calls_disallowed', callCount: 2, parallelAllowed: false });
   assert.match(error.message, /不允许并行调用/);
   assert.match(error.message, /2 个/);
 });

@@ -68,14 +68,30 @@
         </button>
       </div>
 
+      <section id="opencode-banner" class="opencode-banner" role="region" aria-label="OpenCode 运行环境提示" hidden>
+        <div class="opencode-banner-body">
+          <strong id="opencode-banner-title"></strong>
+          <p id="opencode-banner-desc"></p>
+        </div>
+        <div class="opencode-banner-actions">
+          <button id="opencode-banner-install" class="btn" type="button" hidden>安装 OpenCode</button>
+          <button id="opencode-banner-switch" class="btn" type="button" hidden>切到伪装方案</button>
+          <button id="opencode-banner-retry" class="btn" type="button">重新检测</button>
+          <button id="opencode-banner-dismiss" class="btn" type="button" hidden>知道了</button>
+        </div>
+      </section>
+
       <!-- 模型清单 -->
       <section class="card" aria-labelledby="list-title">
         <div class="card-head">
           <h2 id="list-title">模型清单</h2>
-          <span class="hint" id="list-hint">点一行看详情；左边的小按钮只重测这一个</span>
+          <span class="hint" id="list-hint">点一行看详情；左侧重测，右侧可屏蔽隐藏，最下方可展开隐藏的模型</span>
         </div>
 
-        <div id="notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+        <div id="notice-bar" class="notice-bar" hidden>
+          <div id="notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+          <button id="notice-dismiss" class="notice-dismiss" type="button" aria-label="关闭提示" hidden>×</button>
+        </div>
 
         <div class="list" id="list" tabindex="0" role="region" aria-label="可滚动的模型清单" aria-describedby="list-hint">
           <div class="list-head" aria-hidden="true">
@@ -84,8 +100,28 @@
             <span>能力</span>
             <span>状态</span>
             <span class="col-timing">耗时</span>
+            <span class="col-ops">操作</span>
           </div>
           <div id="rows"></div>
+          <div id="hidden-section" class="hidden-section">
+            <button id="hidden-toggle" class="hidden-toggle" type="button" aria-expanded="false">
+              <span id="hidden-toggle-label">隐藏的模型 (0)</span>
+              <span id="hidden-toggle-hint" class="hidden-toggle-hint">点击展开</span>
+            </button>
+            <div id="hidden-panel" class="hidden-panel" hidden>
+              <div class="hidden-add">
+                <input
+                  id="hidden-id-input"
+                  type="text"
+                  placeholder="输入要屏蔽的模型 ID，例如 opencode/glm-5.3-flash-free"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <button id="hidden-add-btn" class="btn" type="button">按 ID 屏蔽</button>
+              </div>
+              <div id="hidden-rows" class="hidden-rows"></div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -125,6 +161,15 @@
               <button id="act-log-path" class="mini" type="button">请求日志在哪</button>
               <span id="app-version" class="hint" hidden></span>
               <button id="act-check-update" class="mini" type="button" hidden title="到 GitHub 看看有没有新版本；自动检查每 24 小时最多一次，手动检查不限">检查更新</button>
+            </div>
+            <div class="settings settings-relay">
+              <label for="cfg-context-cap" title="写入各接入工具时给未单独设窗口的模型收紧最大上下文，促使其早触发压缩，避免单轮十万级 Token 瞬间耗光免费额度；填 0 表示不限制">客户端上下文上限</label>
+              <input id="cfg-context-cap" class="cap-input" type="number" min="0" step="1000" placeholder="128000">
+              <button id="cfg-cap-save" class="mini" type="button">应用上限</button>
+              <label class="check" title="开启后仅提取本机 OpenCode 的 opencode 账号登录态到隔离区，绝不带入第三方付费 API Key；如你的 opencode 账号充过付费额度请谨慎开启。改完需重启服务生效">
+                <input id="cfg-share-auth" type="checkbox">
+                <span>复用本机 OpenCode 登录态（需重启服务）</span>
+              </label>
             </div>
           </div>
         </details>
@@ -197,6 +242,26 @@
           <button id="update-later" class="btn" type="button">稍后再说</button>
           <button id="update-cancel" class="btn" type="button" hidden>取消下载</button>
           <button id="update-confirm" class="btn target-picker-confirm" type="button">立即更新</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="opencode-install-dialog" class="modal" aria-labelledby="opencode-install-title">
+      <div class="modal-card">
+        <h2 id="opencode-install-title">未检测到本机 OpenCode</h2>
+        <p class="modal-lead" id="opencode-install-lead">
+          打开时未在本机发现已安装的 OpenCode（桌面端或 CLI）。内嵌方案需要依赖 OpenCode 运行；你也可以切换到「伪装」方案免安装直接使用，或先安装 OpenCode 后点击重新检测。
+        </p>
+        <div class="opencode-install-guide">
+          <p>官方安装入口：<code>https://opencode.ai</code></p>
+          <p class="hint">安装 OpenCode 桌面端或命令行版本后，点下方「重新检测」即可自动识别。</p>
+        </div>
+        <div class="modal-actions update-actions">
+          <button id="opencode-install-switch" class="btn" type="button">切到伪装方案</button>
+          <span class="grow"></span>
+          <button id="opencode-install-later" class="btn" type="button">稍后再说</button>
+          <button id="opencode-install-retry" class="btn" type="button">重新检测</button>
+          <button id="opencode-install-open" class="btn target-picker-confirm" type="button">前往官网安装</button>
         </div>
       </div>
     </dialog>

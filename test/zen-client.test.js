@@ -316,7 +316,7 @@ test('prompt：chat 方言的伪装头逐项到位，请求体带桩工具且永
   assert.match(headers['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
   assert.equal(headers['x-opencode-session-id'], headers['x-opencode-session']);
   assert.equal(headers['x-opencode-request'], undefined);
-  assert.equal(headers['x-opencode-client'], 'cli');
+  assert.equal(headers['x-opencode-client'], 'desktop');
   assert.equal(headers['x-opencode-project'], 'global');
   assert.equal(headers.authorization, 'Bearer public');
   assert.equal(headers['x-session-affinity'], headers['x-opencode-session']);
@@ -327,11 +327,10 @@ test('prompt：chat 方言的伪装头逐项到位，请求体带桩工具且永
   assert.deepEqual(req.body.stream_options, { include_usage: true });
   assert.equal(req.body.system, undefined);
   assert.equal(req.body.messages[0].role, 'system');
-  assert.match(req.body.messages[0].content, /^你是测试/);
-  assert.match(req.body.messages[0].content, /<env>[\s\S]*Working directory: unknown[\s\S]*<\/env>/);
+  assert.match(req.body.messages[0].content, /^You are an AI agent running in OpenCode[\s\S]*你是测试[\s\S]*<env>[\s\S]*Working directory: unknown[\s\S]*<\/env>/);
   assert.deepEqual(req.body.messages[1], { role: 'user', content: '你好' });
-  const names = req.body.tools.map((t) => t.function.name).sort();
-  assert.deepEqual(names, ['bash', 'edit', 'glob', 'grep', 'read']);
+  const names = req.body.tools.map((t) => t.function.name);
+  assert.deepEqual(names, ['edit', 'glob', 'grep', 'question', 'read', 'shell', 'skill', 'subagent', 'webfetch', 'websearch', 'write', 'execute']);
   for (const tool of req.body.tools) {
     assert.ok(
       Object.keys(tool.function.parameters?.properties ?? {}).length > 0,
@@ -339,8 +338,8 @@ test('prompt：chat 方言的伪装头逐项到位，请求体带桩工具且永
     );
   }
   assert.equal(
-    req.body.tools.find((tool) => tool.function.name === 'bash').function.description,
-    OPENCODE_TOOL_DESCRIPTIONS.bash,
+    req.body.tools.find((tool) => tool.function.name === 'shell').function.description,
+    OPENCODE_TOOL_DESCRIPTIONS.shell,
   );
 });
 
@@ -474,9 +473,9 @@ test('prompt：anthropic 方言——x-api-key+版本头、input_schema 工具�
   assert.equal(req.headers['x-api-key'], 'public');
   assert.equal(req.headers['anthropic-version'], '2023-06-01');
   assert.equal(req.headers.authorization, 'Bearer public');
-  assert.match(req.body.system, /^系统词[\s\S]*<env>[\s\S]*Working directory: unknown/);
+  assert.match(req.body.system, /^You are an AI agent running in OpenCode[\s\S]*系统词[\s\S]*<env>[\s\S]*Working directory: unknown/);
   assert.equal(req.body.messages[0].role, 'user');
-  assert.equal(req.body.tools[0].name, 'bash');
+  assert.equal(req.body.tools[0].name, 'edit');
   assert.ok(req.body.tools[0].input_schema.required.length > 0);
 });
 
@@ -508,10 +507,10 @@ test('prompt：responses 方言——扁平工具、output_text/function_call �
   const req = stub.requests.find((r) => r.path === '/inference/openai/v1/responses');
   assert.equal(req.headers.authorization, 'Bearer public');
   assert.equal(req.headers['x-api-key'], undefined);
-  assert.match(req.body.instructions, /^系统词[\s\S]*<env>[\s\S]*Working directory: unknown/);
+  assert.match(req.body.instructions, /^You are an AI agent running in OpenCode[\s\S]*系统词[\s\S]*<env>[\s\S]*Working directory: unknown/);
   assert.equal(req.body.input, '你好');
   assert.equal(req.body.tools[0].type, 'function');
-  assert.equal(req.body.tools[0].name, 'bash');
+  assert.equal(req.body.tools[0].name, 'edit');
 });
 
 test('prompt：responses 方言的桩调用转交', async () => {

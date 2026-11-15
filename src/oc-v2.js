@@ -44,7 +44,11 @@ export function promptPayload(message) {
 }
 
 export function permissionPayload(request) {
-  const callID = request?.metadata?.callID ?? request?.metadata?.callId ?? request?.metadata?.toolCallID;
+  const callID =
+    request?.metadata?.callID ??
+    request?.metadata?.callId ??
+    request?.metadata?.toolCallID ??
+    request?.source?.id;
   return {
     ...request,
     permission: request?.action,

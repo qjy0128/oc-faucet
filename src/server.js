@@ -21,6 +21,36 @@ import { BridgeError, asBridgeError } from './errors.js';
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /** 上游并发上限默认值 */
 const DEFAULT_CONCURRENCY = 4;
+const MAX_DIAGNOSTIC_COUNT = 100_000;
+const DIAGNOSTIC_REASONS = new Set([
+  'model_reply_not_string',
+  'envelope_flattened_tool_call',
+  'envelope_fields_missing',
+  'envelope_content_type_invalid',
+  'envelope_calls_json_invalid',
+  'envelope_calls_type_invalid',
+  'envelope_json_invalid',
+  'envelope_not_object',
+  'tool_choice_none_violated',
+  'forced_tool_missing',
+  'forced_tool_mismatch',
+  'required_tool_missing',
+  'parallel_tool_calls_disallowed',
+  'tool_call_not_object',
+  'tool_function_not_object',
+  'tool_call_type_unsupported',
+  'tool_name_missing_or_invalid',
+  'tool_name_unknown',
+  'tool_arguments_json_invalid',
+  'tool_arguments_json_not_object',
+  'tool_arguments_type_invalid',
+]);
+const DIAGNOSTIC_ENUMS = {
+  valueType: new Set(['array', 'boolean', 'missing', 'null', 'number', 'object', 'string']),
+  toolChoice: new Set(['auto', 'forced', 'none', 'required']),
+};
+const DIAGNOSTIC_BOOLEANS = new Set(['hasName', 'hasArguments', 'hasToolCalls', 'hasFunction', 'hasContent', 'hasCalls', 'parallelAllowed']);
+const DIAGNOSTIC_COUNTS = new Set(['callIndex', 'callCount', 'mismatchedCallCount', 'availableToolCount']);
 
 /** 从 package.json 读版本号，读不到就算了，不能因为这个把服务带崩 */
 function readVersion() {
@@ -92,6 +122,44 @@ function presentedKey(req) {
 /** 统一错误体：契约第 8 节规定的形状 */
 function errorBody(code, message) {
   return { type: 'error', error: { type: code, message } };
+}
+
+/** 只让固定枚举、布尔值和有界整数进入日志，不让错误原文或任意字段透传。 */
+function sanitizeDiagnostic(value) {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    const allowedKeys = new Set(['reason', ...Object.keys(DIAGNOSTIC_ENUMS), ...DIAGNOSTIC_BOOLEANS, ...DIAGNOSTIC_COUNTS]);
+    if (!keys.length || keys.some((key) => typeof key !== 'string' || !allowedKeys.has(key))) {
+      return null;
+    }
+    if (keys.some((key) => !Object.prototype.hasOwnProperty.call(descriptors[key], 'value'))) return null;
+
+    const reason = descriptors.reason?.value;
+    if (typeof reason !== 'string' || !DIAGNOSTIC_REASONS.has(reason)) return null;
+
+    const safe = { reason };
+    for (const key of keys) {
+      if (key === 'reason') continue;
+      const field = descriptors[key].value;
+      if (DIAGNOSTIC_COUNTS.has(key)) {
+        const minimum = key === 'callIndex' ? 1 : 0;
+        if (!Number.isSafeInteger(field) || field < minimum || field > MAX_DIAGNOSTIC_COUNT) return null;
+      } else if (DIAGNOSTIC_BOOLEANS.has(key)) {
+        if (typeof field !== 'boolean') return null;
+      } else if (!DIAGNOSTIC_ENUMS[key]?.has(field)) {
+        return null;
+      }
+      safe[key] = field;
+    }
+    return safe;
+  } catch {
+    return null;
+  }
 }
 
 /** 把 URL 路径归到「协议」维度，用于日志里的 protocol 字段 */
@@ -309,11 +377,15 @@ function normalizeError(err, log) {
       status,
       code,
       message: '本机转发服务内部出错。请查看控制面板里的请求日志，或点「请求日志」打开明细。',
+      diagnostic: null,
     };
   }
 
   const message = typeof be.message === 'string' && be.message ? be.message : '本机转发服务内部出错。';
-  return { status, code, message };
+  const retryAfterSeconds = Number.isInteger(be.retryAfterSeconds) && be.retryAfterSeconds > 0
+    ? be.retryAfterSeconds
+    : null;
+  return { status, code, message, diagnostic: sanitizeDiagnostic(be.diagnostic), retryAfterSeconds };
 }
 
 /**
@@ -404,6 +476,13 @@ export function createServer(o = {}) {
 
   const sendError = (res, error) => {
     if (res.headersSent) return;
+    if (
+      (error.status === 429 || error.status === 503) &&
+      Number.isInteger(error.retryAfterSeconds) &&
+      error.retryAfterSeconds > 0
+    ) {
+      res.setHeader('retry-after', String(error.retryAfterSeconds));
+    }
     sendJson(res, error.status, errorBody(error.code, redact(error.message)));
   };
 
@@ -520,7 +599,7 @@ export function createServer(o = {}) {
     meta.stream = !!(prepared && prepared.stream);
 
     // 上游调用排队：超出并发上限的在这里等，而不是被丢掉
-    const result = await limitUpstream(() => bridge.complete({ protocol: flavor, body }));
+    const result = await limitUpstream(() => bridge.complete({ protocol: flavor, body, headers: req.headers }));
 
     const model = (result && result.model) || (prepared && prepared.model) || null;
     const decoded = result && result.decoded ? result.decoded : { content: '', calls: [] };
@@ -647,7 +726,7 @@ export function createServer(o = {}) {
 
   const server = http.createServer((req, res) => {
     const requestStartMs = Date.now();
-    const meta = { model: null, stream: false, tokens: null, error: null, protocol: null };
+    const meta = { model: null, stream: false, tokens: null, error: null, diagnostic: null, protocol: null };
     let logged = false;
 
     const writeLog = (status) => {
@@ -662,6 +741,7 @@ export function createServer(o = {}) {
         elapsedMs: Date.now() - requestStartMs,
         tokens: meta.tokens,
         error: meta.error,
+        ...(meta.diagnostic ? { diagnostic: meta.diagnostic } : {}),
       });
     };
 
@@ -671,6 +751,7 @@ export function createServer(o = {}) {
       .catch((err) => {
         const normalized = normalizeError(err, log);
         meta.error = normalized.code;
+        meta.diagnostic = normalized.diagnostic;
         if (res.headersSent) {
           // 头已经发出去了（流式途中出错）：只能收尾，不能再改状态码
           try {

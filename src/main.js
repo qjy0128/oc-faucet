@@ -12,7 +12,17 @@
 import { BridgeError } from './errors.js';
 import { OcClient } from './oc-client.js';
 import { ZenClient } from './zen-client.js';
-import { collectModels, faucetModels, interleaveByProvider, parseModelId } from './models.js';
+import {
+  collectModels,
+  FAUCET_PROVIDER_ID,
+  faucetModels,
+  findMatchedBlockRules,
+  interleaveByProvider,
+  isModelBlocked,
+  normalizeBlockedModelId,
+  parseModelId,
+} from './models.js';
+import { inspectOpencodeEnv } from './opencode-env.js';
 import { describeReasoning } from './efforts.js';
 import { PROBE_FINGERPRINT, probeMany } from './probe.js';
 import { ProbeCache } from './probe-cache.js';
@@ -20,7 +30,9 @@ import { createServer } from './server.js';
 import { startWebUi } from './webui.js';
 import { buildSystem, decodeEnvelope } from './envelope.js';
 import { buildHandoff } from './handoff.js';
-import { prepareAnthropic, prepareOpenAI, prepareResponses } from './protocol.js';
+import { buildDeltaUserText, prepareAnthropic, prepareOpenAI, prepareResponses } from './protocol.js';
+import { ConversationSessionPool, computeConversationHashes, extractSessionHint } from './session-pool.js';
+import { ModelCooldownTracker } from './cooldown.js';
 import * as zcode from './zcode-config.js';
 import { createTargets } from './targets.js';
 import * as settings from './settings.js';
@@ -64,7 +76,7 @@ function usableContextLimit(baseline, context) {
 }
 
 export class Bridge {
-  constructor({ log = () => {}, targets, makeClient, autoRetryIntervalMs } = {}) {
+  constructor({ log = () => {}, targets, makeClient, autoRetryIntervalMs, inspectOpencode } = {}) {
     this.log = log;
     this.client = null;
     this.server = null;
@@ -82,22 +94,27 @@ export class Bridge {
     // 上游客户端工厂：默认按方案造真的（内嵌 OpenCode / Bun 侧车直连 zen）；
     // makeClient 参数是留给测试的另一条缝（塞假客户端，不触网不起进程）
     this.#clientFactory = makeClient ?? ((mode, options) => this.#makeClient(mode, options));
-    // 失败自动重试的节奏（默认 10 分钟，与失败判定的短 TTL 对齐；测试可调小）
+    this.#inspectOpencode = inspectOpencode ?? inspectOpencodeEnv;
+    // 失败自动重试的节奏（默认 30 分钟，避免后台静默探活频繁消耗共享免费池日限额；测试可调小）
     this.autoRetryIntervalMs =
-      Number.isFinite(autoRetryIntervalMs) && autoRetryIntervalMs > 0 ? autoRetryIntervalMs : 10 * 60 * 1000;
+      Number.isFinite(autoRetryIntervalMs) && autoRetryIntervalMs > 0 ? autoRetryIntervalMs : 30 * 60 * 1000;
     this.state = {
       phase: 'idle', // idle | starting | ready | probing | error
       error: null,
       errorCode: null,
       // 上游方案：embedded = 内嵌隔离 OpenCode；masquerade = Bun 侧车逐字节伪装并直连 zen
       mode: 'embedded',
-      models: [], // 全部模型（含未通过的）
+      models: [], // 全部模型（含未通过及被屏蔽的）
+      blockedModels: [], // 已按模型 ID 屏蔽的规则列表
+      targetContextCap: 128000, // 同步给各接入工具的默认上下文上限（防客户端长期不压缩上下文）
+      shareOpencodeAuth: false, // 默认严格隔离；显式开启时才同步本机 opencode 登录态
       verdicts: new Map(), // modelId -> {verdict, note, checkedAt, elapsedMs, cached}
       port: null,
       apiKey: null,
       // 路由器广播：true = 转发口绑 0.0.0.0，局域网设备凭密钥接入
       lanAccess: false,
       upstream: { ready: false, baseUrl: null },
+      opencode: null, // 本机 OpenCode 安装与独立运行状态
       startedAt: Date.now(),
       progress: null, // {done, total}
       targets: null, // 逐目标状态，见 listTargetStates()；没读过就是 null
@@ -106,6 +123,7 @@ export class Bridge {
 
   /** 给界面看的状态快照（可安全 JSON 序列化） */
   snapshot() {
+    const visibleModels = this.state.models.filter((m) => !this.#isBlocked(m));
     return {
       phase: this.state.phase,
       error: this.state.error,
@@ -116,17 +134,23 @@ export class Bridge {
       apiKey: null, // 绝不把密钥发给渲染进程
       hasApiKey: Boolean(this.state.apiKey),
       upstream: this.state.upstream,
+      opencode: this.state.opencode ? { ...this.state.opencode } : null,
       startedAt: this.state.startedAt,
       progress: this.state.progress,
       zcode: this.state.zcode ?? null,
       // 逐目标状态是 listTargetStates() 最近一次实读的缓存；桌面端同步调本方法，不能现读文件
       targets: this.state.targets ?? [],
-      models: this.state.models.map((m) => this.#view(m)),
+      models: visibleModels.map((m) => this.#view(m)),
+      hiddenModels: this.#hiddenModels(),
+      blockedModels: [...this.state.blockedModels],
+      targetContextCap: this.state.targetContextCap,
+      shareOpencodeAuth: this.state.shareOpencodeAuth === true,
     };
   }
 
   #view(model) {
     const v = this.state.verdicts.get(model.id);
+    const cooldown = this.#cooldowns.get(model.id);
     // 推理档位明细直接复用 efforts 模块的描述：非推理模型拿到空列表/null/false，不报错
     const r = describeReasoning(model);
     return {
@@ -152,32 +176,122 @@ export class Bridge {
       elapsedMs: v?.elapsedMs ?? null,
       checkedAt: v?.checkedAt ?? null,
       cached: v?.cached ?? false,
+      cooldownUntil: cooldown?.until ?? null,
+      cooldownReason: cooldown?.reason ?? null,
     };
   }
 
-  /** 只把「能用」的模型给接入工具，并把「只能聊天」的模型工具关掉 */
+  /** 只把「能用且未被屏蔽」的模型给接入工具，并把「只能聊天」的模型工具关掉 */
   getModels() {
     return [...this.state.verdicts.entries()]
       .filter(([, v]) => usable(v))
       .map(([id, v]) => {
         const m = this.state.models.find((x) => x.id === id);
-        return m ? { ...m, chatOnly: v.verdict === 'chat' } : null;
+        return m && !this.#isBlocked(m) ? { ...m, chatOnly: v.verdict === 'chat' } : null;
       })
       .filter(Boolean);
   }
 
+  #isBlocked(modelOrId) {
+    return isModelBlocked(modelOrId, this.state.blockedModels);
+  }
+
+  #isClientReady() {
+    if (!this.client) return false;
+    if (typeof this.client.ready === 'boolean') return this.client.ready;
+    return this.state.phase === 'ready' || this.state.phase === 'probing';
+  }
+
+  #hiddenModels() {
+    const hidden = [];
+    const matchedRules = new Set();
+    for (const model of this.state.models) {
+      const rules = findMatchedBlockRules(model, this.state.blockedModels);
+      if (!rules.length) continue;
+      for (const rule of rules) matchedRules.add(rule);
+      hidden.push({
+        ...this.#view(model),
+        blocked: true,
+        inCatalog: true,
+        blockRules: rules,
+      });
+    }
+    for (const rule of this.state.blockedModels) {
+      if (matchedRules.has(rule)) continue;
+      const parsed = rule.includes('/') ? parseModelId(rule) : null;
+      hidden.push({
+        id: rule,
+        name: rule,
+        providerID: parsed?.providerID ?? FAUCET_PROVIDER_ID,
+        modelID: parsed?.modelID ?? rule,
+        free: true,
+        reasoning: false,
+        supportedEfforts: [],
+        defaultEffort: null,
+        canDisableThinking: false,
+        images: false,
+        video: false,
+        pdf: false,
+        contextWindow: null,
+        upstreamContextWindow: null,
+        contextWindowOverride: null,
+        contextWindowPending: false,
+        deprecated: false,
+        verdict: 'untested',
+        note: '',
+        elapsedMs: null,
+        checkedAt: null,
+        cached: false,
+        blocked: true,
+        inCatalog: false,
+        blockRules: [rule],
+      });
+    }
+    return hidden;
+  }
+
   #clientFactory;
+  #inspectOpencode;
+  #opencodeCheckedAt = 0;
+  #opencodeCheckPromise = null;
   #autoRetryTimer = null;
   #expectedClientExits = new WeakSet();
+  #sessionPool = new ConversationSessionPool();
+  #cooldowns = new ModelCooldownTracker();
+  #clientTokens = new WeakMap();
+  #nextClientToken = 1;
+
+  #clientToken(client) {
+    if (!client || typeof client !== 'object') return 0;
+    let token = this.#clientTokens.get(client);
+    if (!token) {
+      token = this.#nextClientToken++;
+      this.#clientTokens.set(client, token);
+    }
+    return token;
+  }
+
+  #retirePooledSessions(client = this.client) {
+    const retired = this.#sessionPool.clear();
+    if (!client || typeof client.deleteSession !== 'function') return;
+    for (const sid of retired) {
+      client.deleteSession(sid).catch?.(() => {});
+    }
+  }
 
   /** 按当前方案造一个上游客户端（内嵌 OpenCode，或 Bun 侧车直连 zen） */
-  #makeClient(mode, { onExit } = {}) {
+  #makeClient(mode, { onExit, shareOpencodeAuth = false } = {}) {
     if (mode === 'masquerade') {
-      return new ZenClient({ onLog: (line) => this.log(line), onExit });
+      return new ZenClient({
+        shareOpencodeAuth: shareOpencodeAuth === true,
+        onLog: (line) => this.log(line),
+        onExit,
+      });
     }
     return new OcClient({
       dataDir: settings.dataDir(),
       workdir: settings.workspaceDir(),
+      shareOpencodeAuth: shareOpencodeAuth === true,
       onLog: (line) => this.log(line),
       onExit,
     });
@@ -198,7 +312,11 @@ export class Bridge {
 
       const settingsNow = await settings.readSettings();
       this.state.mode = settingsNow.upstreamMode === 'masquerade' ? 'masquerade' : 'embedded';
+      this.state.blockedModels = [...(settingsNow.blockedModels ?? [])];
+      this.state.targetContextCap = settingsNow.targetContextCap ?? null;
+      this.state.shareOpencodeAuth = settingsNow.shareOpencodeAuth === true;
       const client = this.#clientFactory(this.state.mode, {
+        shareOpencodeAuth: settingsNow.shareOpencodeAuth === true,
         onExit: (detail) => this.#handleUpstreamExit(client, detail),
       });
       this.client = client;
@@ -367,6 +485,7 @@ export class Bridge {
     let nextClient;
     try {
       nextClient = this.#clientFactory(mode, {
+        shareOpencodeAuth: settingsNow.shareOpencodeAuth === true,
         onExit: (detail) => this.#handleUpstreamExit(nextClient, detail),
       });
       await nextClient.start();
@@ -385,6 +504,8 @@ export class Bridge {
       );
     }
 
+    this.#retirePooledSessions(previousClient);
+    this.#cooldowns.clearAll();
     this.client = nextClient;
     this.#expectedClientExits.add(previousClient);
     try {
@@ -592,6 +713,8 @@ export class Bridge {
     }
     if (this.client) {
       const client = this.client;
+      this.#retirePooledSessions(client);
+      this.#cooldowns.clearAll();
       this.#expectedClientExits.add(client);
       try {
         await client.stop();
@@ -647,7 +770,7 @@ export class Bridge {
     const models = await this.refresh();
     let restored = 0;
 
-    for (const model of models) {
+    for (const model of this.state.models) {
       if (this.state.verdicts.has(model.id)) continue; // 内存里已有更新的结论，别覆盖
       let hit = null;
       try {
@@ -679,6 +802,9 @@ export class Bridge {
       const payload = await this.client.providers();
       const all = collectModels(payload);
       const settingsNow = await settings.readSettings();
+      this.state.blockedModels = [...(settingsNow.blockedModels ?? [])];
+      this.state.targetContextCap = settingsNow.targetContextCap ?? null;
+      this.state.shareOpencodeAuth = settingsNow.shareOpencodeAuth === true;
       const canUseOverrides = this.client.isolate !== false;
       // 水龙头只放 OpenCode 官方那家的免费模型；用户在 OpenCode 里另外配的供应商
       //（阿里、OpenAI、智谱……）花的是他自己的钱，不该替他决定（见 faucetModels）。
@@ -711,7 +837,7 @@ export class Bridge {
         ttlMs: settingsNow.probeTtlMinutes * 60 * 1000,
       });
       await this.cache.load();
-      return this.state.models;
+      return this.state.models.filter((m) => !this.#isBlocked(m));
     } finally {
       this.activeRefreshCount -= 1;
     }
@@ -881,18 +1007,25 @@ export class Bridge {
       const waitForChange = this.#reservePrompt();
       if (waitForChange) await waitForChange;
       promptReserved = true;
+      if (!this.#isClientReady()) throw new BridgeError('OpenCode 还没起来', 503, 'not_ready');
+      const settingsNow = await settings.readSettings();
+      this.state.blockedModels = [...(settingsNow.blockedModels ?? [])];
+      this.state.targetContextCap = settingsNow.targetContextCap ?? null;
+      this.state.shareOpencodeAuth = settingsNow.shareOpencodeAuth === true;
       const all = this.state.models.length ? this.state.models : await this.refresh();
-      // 只重测失败的那批（自动重试路径）；正常路径测全部
+      const unblocked = all.filter((m) => !this.#isBlocked(m));
+      // 只重测失败的那批（自动重试路径）；正常路径测全部（已屏蔽或仍在限流冷却中的不占额度）
       const pool = onlyFailed
-        ? all.filter((m) => this.state.verdicts.get(m.id)?.verdict === 'failed')
-        : all;
+        ? unblocked.filter(
+            (m) => this.state.verdicts.get(m.id)?.verdict === 'failed' && !this.#cooldowns.get(m.id),
+          )
+        : unblocked;
       if (!pool.length) return [];
       // 现在只有 opencode 一家，摊开其实是个原样复制的空操作；留着是因为：
       // 万一以后放开到多家，这一段能自动按来源轮流取，不会一头撞死在同一个来源上。
       const ordered = interleaveByProvider(pool);
       const models = Number.isInteger(limit) && limit > 0 ? ordered.slice(0, limit) : ordered;
       if (!models.length) return [];
-      const settingsNow = await settings.readSettings();
       this.state.phase = 'probing';
       this.state.progress = { done: 0, total: models.length };
       try {
@@ -908,10 +1041,14 @@ export class Bridge {
           onProgress: ({ done, total, model, result }) => {
             this.state.progress = { done, total };
             this.state.verdicts.set(model.id, result);
+            if (usable(result)) this.#cooldowns.recordSuccess(model.id);
             this.log(`[${done}/${total}] ${model.name} → ${result.verdict}${result.cached ? '（缓存）' : ''}`);
           },
         });
-        for (const r of results) this.state.verdicts.set(r.model.id, r);
+        for (const r of results) {
+          this.state.verdicts.set(r.model.id, r);
+          if (usable(r)) this.#cooldowns.recordSuccess(r.model.id);
+        }
         return results;
       } finally {
         this.state.progress = null;
@@ -950,7 +1087,13 @@ export class Bridge {
   async #retryFailed() {
     if (this.state.phase !== 'ready' || !this.state.models.length) return;
     if (this.activePromptCount > 0 || this.activeRefreshCount > 0 || this.contextWindowChangeInFlight) return;
-    const failed = this.state.models.filter((m) => this.state.verdicts.get(m.id)?.verdict === 'failed');
+    if (this.#cooldowns.hasRecentRateLimit()) return;
+    const failed = this.state.models.filter(
+      (m) =>
+        !this.#isBlocked(m) &&
+        !this.#cooldowns.get(m.id) &&
+        this.state.verdicts.get(m.id)?.verdict === 'failed',
+    );
     if (!failed.length) return;
     this.log(`自动重试 ${failed.length} 个体检失败的模型（池子轮换后它们可能已恢复）……`);
     // onlyFailed 已经筛过"内存里是失败态"，重试就必须真测这批——
@@ -1017,14 +1160,28 @@ export class Bridge {
   }
 
   /**
+   * 为无单独覆写的模型收紧写给外部客户端的上下文上限，促使其更早触发压缩，
+   * 避免单轮十万级 Token 连续重放把免费日限额迅速耗光。用户显式指定过的单模型窗口照旧保留。
+   */
+  #applyTargetContextCap(models, cap) {
+    if (!Number.isInteger(cap) || cap <= 0) return models;
+    return models.map((m) => {
+      if (m?.contextWindowOverride != null) return m;
+      if (!Number.isFinite(m?.contextWindow) || m.contextWindow <= cap) return m;
+      return { ...m, contextWindow: cap };
+    });
+  }
+
+  /**
    * 决定这一次写给目标的模型清单。
    * 界面显式指定就用指定的；没指定时用上次记住的那份（体检后已不可用的自动剔掉）；
    * 从没选过就全部写入。记住选择是为了改密钥、改上下文之后的重写不会偷偷扩大范围。
    */
   async #selectedForTarget(target, modelIds) {
-    const usable = this.getModels();
+    const savedSettings = await settings.readSettings();
+    const usable = this.#applyTargetContextCap(this.getModels(), savedSettings.targetContextCap);
     if (target.selectsModels !== true) return usable;
-    const saved = (await settings.readSettings()).targetModels;
+    const saved = savedSettings.targetModels;
     if (Array.isArray(modelIds)) {
       const picked = usable.filter((model) => modelIds.includes(model.id));
       if (!picked.length) {
@@ -1144,13 +1301,13 @@ export class Bridge {
   }
 
   /**
-   * 处理一次转发请求。server 把解析好的 body 传进来，这里负责：
-   * 选模型 → 判定 chatOnly → 拼系统提示 → 问 OpenCode → 解信封。
+   * 处理一次转发请求。server 把解析好的 body 与请求头传进来，这里负责：
+   * 选模型 → 熔断冷却检查 → 会话复用/增量历史计算 → 调上游 → 解信封 → 故障记冷却。
    */
-  async complete({ protocol, body }) {
+  async complete({ protocol, body, headers } = {}) {
     const waitForChange = this.#reservePrompt();
     if (waitForChange) await waitForChange;
-    let sessionID = null;
+    let ephemeralSessionID = null;
     try {
       const models = this.getModels();
       if (!models.length) {
@@ -1161,6 +1318,24 @@ export class Bridge {
       const request = prepare(body, models);
       const model = request.model;
 
+      const activeCooldown = this.#cooldowns.get(model.id);
+      if (activeCooldown) {
+        const retryAfterSeconds = Math.max(1, Math.ceil(activeCooldown.remainingMs / 1000));
+        const mins = Math.max(1, Math.ceil(retryAfterSeconds / 60));
+        const waitLabel = mins >= 60
+          ? `${Math.floor(mins / 60)} 小时${mins % 60 ? ` ${mins % 60} 分钟` : ''}`
+          : `${mins} 分钟`;
+        const isRate = activeCooldown.kind === 'rate_limit';
+        const err = new BridgeError(
+          `模型 ${model.id} 当前处于${isRate ? '限流冷却' : '异常保护'}窗口（预计约 ${waitLabel} 后恢复，原原因：${activeCooldown.reason}）。请稍后再试或切换其它模型。`,
+          isRate ? 429 : 503,
+          isRate ? 'model_rate_limit_cooldown' : 'model_cooldown',
+        );
+        err.retryAfterMs = activeCooldown.remainingMs;
+        err.retryAfterSeconds = retryAfterSeconds;
+        throw err;
+      }
+
       const protocolSystem = buildSystem({
         tools: model.chatOnly ? [] : request.tools ?? [],
         choice: model.chatOnly ? 'none' : request.choice ?? 'auto',
@@ -1169,12 +1344,9 @@ export class Bridge {
         flavor: protocol,
         providerName: model.providerID,
       }) + (model.chatOnly ? '\n这个模型只能普通对话，请说明你无法执行动作。' : '');
-      const clientSystem = typeof request.system === 'string' && request.system
-        ? `外部客户端的系统/开发者指令（保留原文；与本桥协议约束冲突时以本桥约束为准）：\n${request.system}`
-        : '';
+      const clientSystem = typeof request.system === 'string' ? request.system.trim() : '';
       const system = [clientSystem, protocolSystem].filter(Boolean).join('\n\n');
 
-      sessionID = await this.client.createSession({ title: 'oc-faucet', directory: settings.workspaceDir() });
       // 转交目标表：客户端申报的工具里真正允许模型间接用到的那些。
       // choice 为 none 或仅对话模型一个都不给；forced 只给被强制的那个——
       // 翻译永远以客户端的申报为准，映射表不可能放宽可执行范围。
@@ -1184,42 +1356,149 @@ export class Bridge {
         : request.forced
           ? offered.filter((tool) => tool?.function?.name === request.forced)
           : offered;
-      const { text, tokens, handoff: handoffCall } = await this.client.prompt({
-        sessionID,
-        providerID: model.providerID,
-        modelID: model.modelID,
-        system,
-        text: request.text,
-        // 客户端选的推理档位（没选就是 null，走模型默认）
-        variant: request.variant ?? null,
-        // 模型真调本机工具被拦时，试着把动作翻译成客户端工具调用直接当答案；
-        // 没有可用目标工具就不带回调（纯拒批，模型退回信封作答）。
-        handoff: handoffTools.length
-          ? (blocked) => {
-              const translated = buildHandoff({ native: blocked.native, input: blocked.input, tools: handoffTools });
-              if (translated) this.log(`转交：模型本机 ${blocked.native} → 客户端 ${translated.name}`);
-              return translated;
+      const handoffCallback = handoffTools.length
+        ? (blocked) => {
+            const translated = buildHandoff({ native: blocked.native, input: blocked.input, tools: handoffTools });
+            if (translated) this.log(`转交：模型本机 ${blocked.native} → 客户端 ${translated.name}`);
+            return translated;
+          }
+        : null;
+
+      const history = Array.isArray(request.history) ? request.history : [];
+      const images = Array.isArray(request.images) ? request.images : [];
+      const isStatefulClient = this.client instanceof ZenClient ? false : this.client?.isolate !== false;
+      const { systemHash, cumulativeHashes } = computeConversationHashes(system, history);
+      const explicitHint = extractSessionHint({ body, headers });
+      const clientToken = this.#clientToken(this.client);
+      const poolKey = this.#sessionPool.makeKey({
+        clientToken,
+        modelId: model.id,
+        systemHash,
+        firstItemHash: cumulativeHashes[0] ?? null,
+        explicitHint,
+      });
+
+      return await this.#sessionPool.withLock(poolKey, async () => {
+        const retiredToDelete = [];
+        try {
+          const acquired = this.#sessionPool.acquire(poolKey, {
+            stateful: isStatefulClient,
+            systemHash,
+            cumulativeHashes,
+          });
+          retiredToDelete.push(...acquired.retiredSessionIDs);
+
+          let sessionID = acquired.reuseSessionID;
+          let isContinuation = false;
+          let promptText = request.text;
+
+          if (sessionID) {
+            if (isStatefulClient && Number.isInteger(acquired.sendDeltaFromIndex) && acquired.sendDeltaFromIndex > 0) {
+              const deltaSlice = history.slice(acquired.sendDeltaFromIndex);
+              if (deltaSlice.length > 0) {
+                isContinuation = true;
+                promptText = buildDeltaUserText(deltaSlice, images);
+              }
             }
-          : null,
+          } else {
+            sessionID = await this.client.createSession({ title: 'New session', directory: settings.workspaceDir() });
+            if (!poolKey) ephemeralSessionID = sessionID;
+          }
+
+          const sendPrompt = (sid, textToSend, continuationFlag) => this.client.prompt({
+            sessionID: sid,
+            providerID: model.providerID,
+            modelID: model.modelID,
+            system,
+            text: textToSend,
+            ...(continuationFlag ? { isContinuation: true } : {}),
+            ...(!isStatefulClient && !continuationFlag && history.length ? { history, images, envelope: true } : {}),
+            // 客户端选的推理档位（没选就是 null，走模型默认）
+            variant: request.variant ?? null,
+            handoff: handoffCallback,
+          });
+
+          let promptResult;
+          try {
+            promptResult = await sendPrompt(sessionID, promptText, isContinuation);
+          } catch (error) {
+            // 已复用的有状态会话若在 OpenCode 侧被删/失效，自动重建新会话用全量重放一次
+            if (isContinuation && error?.code === 'session_not_found' && poolKey) {
+              const staleSid = this.#sessionPool.invalidate(poolKey);
+              if (staleSid && staleSid !== sessionID) retiredToDelete.push(staleSid);
+              sessionID = await this.client.createSession({ title: 'New session', directory: settings.workspaceDir() });
+              isContinuation = false;
+              promptResult = await sendPrompt(sessionID, request.text, false);
+            } else {
+              if (poolKey && isStatefulClient) {
+                const invalidatedSid = this.#sessionPool.invalidate(poolKey);
+                if (invalidatedSid) retiredToDelete.push(invalidatedSid);
+                if (sessionID && sessionID !== invalidatedSid) retiredToDelete.push(sessionID);
+              }
+              throw error;
+            }
+          }
+
+          const { text, tokens, handoff: handoffCall } = promptResult;
+          this.#cooldowns.recordSuccess(model.id);
+
+          if (poolKey) {
+            const evicted = this.#sessionPool.commit(poolKey, {
+              sessionID,
+              stateful: isStatefulClient,
+              systemHash,
+              cumulativeHashes,
+              dirty: isStatefulClient && Boolean(handoffCall),
+            });
+            retiredToDelete.push(...evicted);
+          }
+
+          // 转交命中：被拦的动作直接成为这次回复，不再解信封（单条调用、
+          // 且已按客户端申报的工具表预校验，信封的 choice/forced/parallel 复核不适用）。
+          // 执行权照旧在外部客户端手里：返回的只是提议，和信封里的 calls 完全同权。
+          if (handoffCall) {
+            return { model, decoded: { content: '', calls: [handoffCall] }, tokens };
+          }
+          const decoded = decodeEnvelope(text, {
+            tools: request.tools ?? [],
+            choice: request.choice ?? 'auto',
+            forced: request.forced ?? null,
+            parallel: request.parallel !== false,
+          });
+          if (model.chatOnly && decoded.calls.length) {
+            throw new BridgeError('这个模型只能普通对话，不支持执行动作', 502, 'tools_not_supported');
+          }
+          return { model, decoded, tokens };
+        } catch (error) {
+          if (
+            error &&
+            error.code !== 'tools_not_supported' &&
+            error.code !== 'client_closed_request' &&
+            error.status !== 499
+          ) {
+            const trip = this.#cooldowns.recordError(model.id, {
+              status: error.status,
+              code: error.code,
+              message: error.message,
+              retryAfterMs: Number.isFinite(error.retryAfterMs)
+                ? error.retryAfterMs
+                : (Number.isFinite(error.retryAfterSeconds) ? error.retryAfterSeconds * 1000 : undefined),
+            });
+            if (trip.tripped) {
+              this.log(
+                `触发熔断冷却 [${model.id}]（${trip.kind}，约 ${Math.ceil(trip.remainingMs / 60000)} 分钟）：${trip.reason}`,
+              );
+            }
+          }
+          throw error;
+        } finally {
+          for (const oldSid of new Set(retiredToDelete)) {
+            if (oldSid) this.client?.deleteSession?.(oldSid).catch?.(() => {});
+          }
+        }
       });
-      // 转交命中：被拦的动作直接成为这次回复，不再解信封（单条调用、
-      // 且已按客户端申报的工具表预校验，信封的 choice/forced/parallel 复核不适用）。
-      // 执行权照旧在外部客户端手里：返回的只是提议，和信封里的 calls 完全同权。
-      if (handoffCall) {
-        return { model, decoded: { content: '', calls: [handoffCall] }, tokens };
-      }
-      const decoded = decodeEnvelope(text, {
-        tools: request.tools ?? [],
-        choice: request.choice ?? 'auto',
-        forced: request.forced ?? null,
-        parallel: request.parallel !== false,
-      });
-      if (model.chatOnly && decoded.calls.length) {
-        throw new BridgeError('这个模型只能普通对话，不支持执行动作', 502, 'tools_not_supported');
-      }
-      return { model, decoded, tokens };
     } finally {
-      if (sessionID) this.client.deleteSession(sessionID).catch(() => {});
+      if (ephemeralSessionID) this.client?.deleteSession?.(ephemeralSessionID).catch?.(() => {});
       this.activePromptCount -= 1;
     }
   }
@@ -1443,7 +1722,113 @@ export class Bridge {
         throw new BridgeError('判定有效期必须是有限的正数。', 400, 'invalid_probe_ttl');
       }
     }
-    return settings.writeSettings(patch);
+    if (patch && Object.hasOwn(patch, 'blockedModels')) {
+      const candidate = patch.blockedModels;
+      if (!Array.isArray(candidate) || candidate.some((item) => !normalizeBlockedModelId(item))) {
+        throw new BridgeError('屏蔽模型 ID 列表无效：每项必须是无空白的模型 ID。', 400, 'invalid_blocked_models');
+      }
+    }
+    if (patch && Object.hasOwn(patch, 'targetContextCap')) {
+      const value = patch.targetContextCap;
+      const validZeroOrNull = value === null || value === 0;
+      const validPositive = typeof value === 'number' && Number.isInteger(value) && value >= 1024 && value <= 10_000_000;
+      if (!validZeroOrNull && !validPositive) {
+        throw new BridgeError(
+          '客户端上下文上限必须是 0（不限制）或 1024 到 10000000 之间的整数。',
+          400,
+          'invalid_target_context_cap',
+        );
+      }
+    }
+    if (patch && Object.hasOwn(patch, 'shareOpencodeAuth')) {
+      if (typeof patch.shareOpencodeAuth !== 'boolean') {
+        throw new BridgeError('复用本机 OpenCode 登录态开关只接受 true 或 false。', 400, 'invalid_share_opencode_auth');
+      }
+    }
+    const previousCap = this.state.targetContextCap;
+    const previousShareAuth = this.state.shareOpencodeAuth;
+    const saved = await settings.writeSettings(patch);
+    this.state.blockedModels = [...(saved.blockedModels ?? [])];
+    this.state.targetContextCap = saved.targetContextCap ?? null;
+    this.state.shareOpencodeAuth = saved.shareOpencodeAuth === true;
+    if (patch && Object.hasOwn(patch, 'targetContextCap') && this.state.targetContextCap !== previousCap) {
+      if (this.server && this.getModels().length > 0) {
+        const failures = await this.#syncWrittenTargets().catch((error) => [error?.message ?? String(error)]);
+        if (failures.length) {
+          this.log(`上下文上限设置已保存，但部分接入目标未同步：${failures.join('；')}`);
+        }
+      }
+    }
+    if (patch && Object.hasOwn(patch, 'shareOpencodeAuth') && this.state.shareOpencodeAuth !== previousShareAuth) {
+      this.log(
+        this.state.shareOpencodeAuth
+          ? '已开启「复用本机 OpenCode 登录态」，请点一次「重启服务」让上游客户端按新凭据启动。'
+          : '已关闭「复用本机 OpenCode 登录态」，请点一次「重启服务」回到完全隔离匿名模式。',
+      );
+    }
+    return saved;
+  }
+
+  /**
+   * 按模型 ID 屏蔽或取消屏蔽模型；会持久化到 settings.json 并尽量同步已写入目标。
+   *
+   * @param {string} rawId 模型 ID（如 `opencode/glm-5.3-flash-free` 或简写）
+   * @param {boolean} [blocked=true] true=屏蔽并隐藏，false=取消屏蔽恢复显示
+   */
+  async setModelBlocked(rawId, blocked = true) {
+    const id = normalizeBlockedModelId(rawId);
+    if (!id) {
+      throw new BridgeError('请输入有效的模型 ID（如 opencode/glm-5.3-flash-free），且不能包含空格。', 400, 'invalid_model_id');
+    }
+    const current = await settings.readSettings();
+    const list = [...(current.blockedModels ?? [])];
+    const shouldBlock = blocked !== false;
+    let next;
+    if (shouldBlock) {
+      next = list.includes(id) ? list : [...list, id];
+    } else {
+      const model = this.state.models.find((m) => m.id === id || m.modelID === id);
+      const toRemove = new Set([id, ...findMatchedBlockRules(model ?? id, list)]);
+      next = list.filter((entry) => !toRemove.has(entry));
+    }
+    const saved = await settings.writeSettings({ blockedModels: next });
+    this.state.blockedModels = [...(saved.blockedModels ?? [])];
+    if (this.server && this.getModels().length > 0) {
+      const failures = await this.#syncWrittenTargets().catch((error) => [error?.message ?? String(error)]);
+      if (failures.length) {
+        this.log(`模型屏蔽设置已保存，但部分接入目标未同步：${failures.join('；')}`);
+      }
+    }
+    return { ok: true, id, blocked: shouldBlock, blockedModels: [...this.state.blockedModels] };
+  }
+
+  /**
+   * 检测本机 OpenCode 的安装状态与外部独立运行状态（默认带 2s 节流，避免频繁扫进程）。
+   */
+  async checkOpencodeEnv({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && this.state.opencode && now - this.#opencodeCheckedAt < 2000) {
+      return { ...this.state.opencode };
+    }
+    if (this.#opencodeCheckPromise) return this.#opencodeCheckPromise;
+
+    const ownPids = [process.pid, this.client?.child?.pid, this.client?.pid].filter(
+      (pid) => Number.isInteger(pid) && pid > 0,
+    );
+    const pending = Promise.resolve()
+      .then(() => this.#inspectOpencode({ ownPids }))
+      .then((result) => {
+        if (result && typeof result === 'object') {
+          this.state.opencode = { ...result };
+          this.#opencodeCheckedAt = Date.now();
+        }
+        return this.state.opencode ? { ...this.state.opencode } : null;
+      })
+      .finally(() => {
+        if (this.#opencodeCheckPromise === pending) this.#opencodeCheckPromise = null;
+      });
+    this.#opencodeCheckPromise = pending;
+    return pending;
   }
 
   /** OpenCode 会话的工作目录，体检时要往里放靶子文件 */
@@ -1468,12 +1853,16 @@ export class Bridge {
   async probeOne(modelId) {
     const model = this.state.models.find((m) => m.id === modelId);
     if (!model) throw new BridgeError('找不到这个模型，可能目录刚刷新过。', 404, 'model_not_found');
+    if (this.#isBlocked(model)) {
+      throw new BridgeError('这个模型已被屏蔽，先取消屏蔽再重测。', 400, 'model_blocked');
+    }
     this.#reserveSingleProbe(modelId);
     let promptReserved = false;
     try {
       const waitForChange = this.#reservePrompt();
       if (waitForChange) await waitForChange;
       promptReserved = true;
+      if (!this.#isClientReady()) throw new BridgeError('OpenCode 还没起来', 503, 'not_ready');
       const [result] = await probeMany({
         client: this.client,
         models: [model],
@@ -1483,7 +1872,10 @@ export class Bridge {
         force: true,
         fingerprint: this.#probeFingerprint(),
       });
-      if (result) this.state.verdicts.set(modelId, result);
+      if (result) {
+        this.state.verdicts.set(modelId, result);
+        if (usable(result)) this.#cooldowns.recordSuccess(modelId);
+      }
       return result ? this.#view(model) : null;
     } finally {
       if (promptReserved) this.activePromptCount -= 1;

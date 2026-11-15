@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { BridgeError } from './errors.js';
+import { normalizeBlockedModelId } from './models.js';
 
 const APP_DIR_NAME = 'OC Faucet';
 
@@ -106,18 +107,56 @@ const DEFAULTS = {
   modelContextWindowPending: {},
   // 按接入目标记住「这次要写入哪些模型」；没记的就是全部可用模型
   targetModels: {},
+  // 按模型 ID 屏蔽的模型（支持完整 `provider/model` 或简写 `model`）
+  blockedModels: [],
+  // 同步给各接入工具（如 ZCode / Claude / Codex）的上下文上限，防止客户端长期不压缩上下文耗光免费额度；null 表示不限制
+  targetContextCap: 128000,
+  // 显式开启时才把本机 OpenCode auth.json 里的 `opencode` 条目同步进隔离环境；绝不带入其它供应商凭据
+  shareOpencodeAuth: false,
 };
+
+function cloneDefaults() {
+  return {
+    ...DEFAULTS,
+    modelContextWindows: {},
+    modelContextWindowOriginals: {},
+    modelContextWindowPending: {},
+    targetModels: {},
+    blockedModels: [],
+  };
+}
+
+export function sanitizeTargetContextCap(raw, fallback = DEFAULTS.targetContextCap) {
+  if (raw === null || raw === 0 || raw === '0' || raw === false) return null;
+  if (raw === undefined || raw === '') return fallback;
+  const num = Number(raw);
+  if (Number.isInteger(num) && num >= 1024 && num <= 10_000_000) return num;
+  return fallback;
+}
+
+function sanitizeBlockedModels(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const result = [];
+  for (const item of raw) {
+    const id = normalizeBlockedModelId(item);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    result.push(id);
+  }
+  return result;
+}
 
 /** 读设置。坏文件回落到默认值，不抛异常——配置坏了不该让程序起不来。 */
 export async function readSettings() {
   const file = settingsFile();
-  if (!existsSync(file)) return { ...DEFAULTS };
+  if (!existsSync(file)) return cloneDefaults();
   try {
     const parsed = JSON.parse(await readFile(file, 'utf8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ...DEFAULTS };
-    return sanitize({ ...DEFAULTS, ...parsed });
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return cloneDefaults();
+    return sanitize({ ...cloneDefaults(), ...parsed });
   } catch {
-    return { ...DEFAULTS };
+    return cloneDefaults();
   }
 }
 
@@ -203,6 +242,9 @@ function sanitize(s) {
     modelContextWindowOriginals,
     modelContextWindowPending,
     targetModels,
+    blockedModels: sanitizeBlockedModels(s.blockedModels),
+    targetContextCap: sanitizeTargetContextCap(s.targetContextCap, DEFAULTS.targetContextCap),
+    shareOpencodeAuth: typeof s.shareOpencodeAuth === 'boolean' ? s.shareOpencodeAuth : DEFAULTS.shareOpencodeAuth,
   };
 }
 

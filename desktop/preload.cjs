@@ -40,6 +40,9 @@ contextBridge.exposeInMainWorld('oc', {
   installTarget: (id, modelIds) => invokeClean('oc:install-target', { id, modelIds }),
   uninstallTarget: (id) => invokeClean('oc:uninstall-target', id),
   setModelContextWindow: (id, value) => invokeClean('oc:set-model-context-window', { id, value }),
+  setModelBlocked: (id, blocked = true) => invokeClean('oc:set-model-blocked', { id, blocked }),
+  checkOpencodeEnv: () => invokeClean('oc:check-opencode'),
+  openOpencodeInstall: () => invokeClean('oc:open-opencode-install'),
   // 密钥读改：返回形状与 Web 版一致（{key} / {ok:true}）
   getApiKey: () => invokeClean('oc:get-api-key'),
   setApiKey: (key) => invokeClean('oc:set-api-key', key),

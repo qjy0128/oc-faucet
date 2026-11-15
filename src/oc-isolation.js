@@ -17,7 +17,7 @@
  *   - 随机口令 + Basic 认证，本机别的程序也调不动它
  *   - 一份写死的配置：本机动作一律不批、自动更新关、分享关
  */
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
@@ -79,46 +79,87 @@ const EXTRA_DIRS = Object.freeze(['project', 'home']);
  *   真正的执行权在客户端那边，本桥只让它产出 JSON 信封。
  * - `autoupdate` / `share` / 外部技能全关：接入行为不该因为上游偷偷升级而变。
  */
+/**
+ * 隔离权限配置：全部工具标 `ask`，让上游拿到的工具清单与桌面端 OpenCode 保持一致，
+ * 同时保证本机不会偷偷执行任何工具（由 OcClient 拦截并转交/拒批，execute/websearch 等
+ * 不走通用审批的工具则由 bridge.js 的 execute.before 钩子直接拦下）。
+ */
+const ISOLATED_PERMISSION = Object.freeze({
+  '*': 'ask',
+  question: 'ask',
+  websearch: 'ask',
+  codesearch: 'ask',
+  webfetch: 'ask',
+  subagent: 'ask',
+  task: 'ask',
+  skill: 'ask',
+  execute: 'ask',
+});
+
 export const isolatedConfig = Object.freeze({
-  permission: {
-    '*': 'ask',
-    question: 'deny',
-    websearch: 'deny',
-    codesearch: 'deny',
-    webfetch: 'deny',
-    task: 'deny',
-    plan_enter: 'deny',
-    plan_exit: 'deny',
-    todowrite: 'deny',
-  },
+  permission: ISOLATED_PERMISSION,
   autoupdate: false,
   share: 'disabled',
   agent: {
-    // 外部推理专用：只按信封协议作答，绝不碰本机工具
+    // 外部推理专用：不覆盖 OpenCode 原生 system prompt（信封指令通过插件 context hook 注入）
     'oc-faucet': {
       mode: 'primary',
-      description: 'OC Faucet 外部推理',
-      prompt:
-        '你是外部助手的推理组件。绝不调用 OpenCode 自带的工具；' +
-        '需要外部工具时，只能在被要求的 JSON 响应里描述调用。' +
-        '外部客户端拥有执行权，并会在下一次请求里把工具结果给你。',
-      permission: {
-        '*': 'ask',
-        question: 'deny',
-        websearch: 'deny',
-        codesearch: 'deny',
-        webfetch: 'deny',
-        task: 'deny',
-        plan_enter: 'deny',
-        plan_exit: 'deny',
-        todowrite: 'deny',
-      },
+      permission: ISOLATED_PERMISSION,
     },
   },
 });
 
 /** 这只 OpenCode 用的 agent 名 */
 export const ISOLATED_AGENT = 'oc-faucet';
+
+const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * 写入供 v2 OpenCode 插件加载的桥接插件：
+ *   1. `session.hook('context')`：把每个 session 的信封/外部系统词追加进真正的 system prompt
+ *      （保持原生 Harness 前缀、按轮次稳定命中提示词缓存、不污染 messages[1] user 消息）。
+ *   2. `tool.hook('execute.before')`：OpenCode 2.2+ 的 Code Mode `execute` 在纯 JS 计算时不会触发
+ *      permission.asked，必须在这里硬拦截 execute/websearch/subagent/task/question/codesearch，
+ *      确保隔离环境下 100% 不发生本机越权执行。
+ */
+const BRIDGE_PLUGIN_SOURCE = `import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/;
+const SYSTEM_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'session-systems');
+const BLOCKED_EXECUTE_TOOLS = new Set([
+  'execute',
+  'websearch',
+  'codesearch',
+  'subagent',
+  'task',
+  'question',
+  'plan_enter',
+  'plan_exit',
+  'todowrite',
+]);
+
+export default {
+  id: 'context-bridge',
+  setup(api) {
+    api.session.hook('context', (ctx) => {
+      try {
+        if (!ctx?.sessionID || !SESSION_ID_RE.test(ctx.sessionID)) return;
+        const extra = readFileSync(join(SYSTEM_DIR, ctx.sessionID + '.txt'), 'utf8');
+        if (extra && Array.isArray(ctx.system)) ctx.system.push({ text: extra });
+      } catch {
+        // 没有对应 session 系统词文件时静默退回 OpenCode 原生 system
+      }
+    });
+    api.tool.hook('execute.before', (ctx) => {
+      if (BLOCKED_EXECUTE_TOOLS.has(ctx?.tool)) {
+        throw new Error('Tool "' + ctx.tool + '" is disabled in this session; return tool calls in the JSON calls array instead.');
+      }
+    });
+  },
+};
+`;
 
 /** 运行时根目录：`<数据目录>/opencode` */
 export function runtimeRoot(dataDir) {
@@ -133,10 +174,40 @@ export function runtimeRoot(dataDir) {
  * @param {string} root `runtimeRoot()` 的返回值
  * @returns {string} 同一个 root，方便链式调用
  */
+export function ensureBridgePlugin(root) {
+  const pluginDir = join(root, 'config', 'opencode', 'plugins');
+  const systemDir = join(root, 'session-systems');
+  mkdirSync(pluginDir, { recursive: true, mode: 0o700 });
+  mkdirSync(systemDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(pluginDir, 'bridge.js'), BRIDGE_PLUGIN_SOURCE, { mode: 0o600 });
+  return root;
+}
+
+/** 写入单会话追加到 OpenCode 原生 system prompt 尾部的文本（供 bridge.js context hook 读取） */
+export function writeSessionSystemPrompt(root, sessionID, text) {
+  if (typeof sessionID !== 'string' || !SESSION_ID_RE.test(sessionID)) {
+    throw new TypeError(`非法 sessionID：${String(sessionID)}`);
+  }
+  const systemDir = join(root, 'session-systems');
+  mkdirSync(systemDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(systemDir, `${sessionID}.txt`), text, { mode: 0o600 });
+}
+
+/** 清理单个会话的 system prompt 临时文件；失败静默 */
+export function clearSessionSystemPrompt(root, sessionID) {
+  if (typeof sessionID !== 'string' || !SESSION_ID_RE.test(sessionID)) return;
+  try {
+    rmSync(join(root, 'session-systems', `${sessionID}.txt`), { force: true });
+  } catch {
+    // 清理失败不影响主流程
+  }
+}
+
 export function ensureRuntimeDirs(root) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   for (const name of XDG_DIRS) mkdirSync(join(root, name), { recursive: true, mode: 0o700 });
   for (const name of EXTRA_DIRS) mkdirSync(join(root, name), { recursive: true, mode: 0o700 });
+  ensureBridgePlugin(root);
   return root;
 }
 
@@ -183,6 +254,7 @@ export function buildIsolatedEnv({ root, baseEnv = process.env, password, userna
   }
 
   // 这几项在 extraEnv 之后钉死：调用方不该能把隔离关掉
+  env.OPENCODE_CLIENT = 'desktop';
   env.OPENCODE_SERVER_USERNAME = username;
   env.OPENCODE_SERVER_PASSWORD = password;
   env.OPENCODE_DISABLE_AUTOUPDATE = 'true';

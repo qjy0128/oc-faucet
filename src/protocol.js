@@ -164,6 +164,8 @@ export function prepareAnthropic(body, models) {
     model,
     system,
     text: buildUserText(history, images),
+    history,
+    images,
     tools,
     choice: toolChoice.choice,
     forced: toolChoice.forced,
@@ -391,6 +393,8 @@ export function prepareOpenAI(body, models) {
     model,
     system,
     text: buildUserText(history, images),
+    history,
+    images,
     tools,
     choice: toolChoice.choice,
     forced: toolChoice.forced,
@@ -638,6 +642,8 @@ export function prepareResponses(body, models) {
     model,
     system: systemParts.filter(Boolean).join('\n\n'),
     text: buildUserText(history, images),
+    history,
+    images,
     tools,
     choice: toolChoice.choice,
     forced: toolChoice.forced,
@@ -1289,7 +1295,7 @@ function parseArgumentsLoose(value, where) {
  * 模型看不到真正的 messages 数组（OpenCode 侧只收一段文本），所以这里要写得足够清楚：
  * 每条工具调用和它的结果都带上 tool_call_id，第 8 条约束靠它才能对上号。
  */
-function buildUserText(history, images) {
+export function buildUserText(history, images) {
   const lines = [];
   if (history.length) {
     lines.push('以下是本轮对话历史（JSON 数组，按时间顺序）：');
@@ -1345,4 +1351,32 @@ function numberOrZero(value) {
 
 function randomId() {
   return Math.random().toString(16).slice(2, 12);
+}
+
+/**
+ * 为已复用会话的增量历史构造精简文本，只附带增量区间实际引用的图片数据。
+ *
+ * @param {Array<object>} historySlice
+ * @param {Array<object>} [allImages]
+ * @returns {string}
+ */
+export function buildDeltaUserText(historySlice, allImages = []) {
+  if (!Array.isArray(historySlice) || !historySlice.length) {
+    return '';
+  }
+  const remappedImages = [];
+  const remap = new Map();
+  const remappedHistory = historySlice.map((item) => {
+    if (!item || item.type !== 'image' || !Number.isInteger(item.image)) return item;
+    let nextIdx = remap.get(item.image);
+    if (!nextIdx) {
+      const img = allImages[item.image - 1];
+      if (!img) return item;
+      remappedImages.push(img);
+      nextIdx = remappedImages.length;
+      remap.set(item.image, nextIdx);
+    }
+    return { ...item, image: nextIdx };
+  });
+  return buildUserText(remappedHistory, remappedImages);
 }

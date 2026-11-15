@@ -93,3 +93,30 @@ test('设置区有版本号与手动检查入口，Web 壳不带更新接口时�
   assert.match(renderer, /const updateSupported = typeof window\.oc\.getUpdateState === 'function';/);
   assert.match(renderer, /if \(!updateSupported\) return;/);
 });
+
+test('桌面端含模型屏蔽隐藏栏、报错关闭按钮与 OpenCode 环境提示弹窗及 IPC 通道', () => {
+  for (const channel of ['oc:set-model-blocked', 'oc:check-opencode', 'oc:open-opencode-install']) {
+    assert.ok(main.includes(`'${channel}'`), `主进程缺少通道：${channel}`);
+    assert.ok(main.includes(`ipcMain.handle('${channel}'`), `通道没有注册处理器：${channel}`);
+  }
+  for (const id of [
+    'opencode-banner',
+    'opencode-install-dialog',
+    'notice-bar',
+    'notice-dismiss',
+    'hidden-section',
+    'hidden-toggle',
+    'hidden-panel',
+    'hidden-id-input',
+    'hidden-add-btn',
+    'hidden-rows',
+  ]) {
+    assert.ok(index.includes(`id="${id}"`), `缺少页面元素：${id}`);
+  }
+  assert.match(declarations('.row-main'), /64px/);
+  assert.match(css, /\.opencode-banner\s*\{/);
+  assert.match(css, /\.hidden-section\s*\{/);
+  assert.match(preload, /setModelBlocked:/);
+  assert.match(preload, /checkOpencodeEnv:/);
+  assert.match(preload, /openOpencodeInstall:/);
+});
