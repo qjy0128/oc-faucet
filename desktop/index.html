@@ -163,8 +163,16 @@
               <button id="act-check-update" class="mini" type="button" hidden title="到 GitHub 看看有没有新版本；自动检查每 24 小时最多一次，手动检查不限">检查更新</button>
             </div>
             <div class="settings settings-relay">
-              <label for="cfg-context-cap" title="写入各接入工具时给未单独设窗口的模型收紧最大上下文，促使其早触发压缩，避免单轮十万级 Token 瞬间耗光免费额度；填 0 表示不限制">客户端上下文上限</label>
-              <input id="cfg-context-cap" class="cap-input" type="number" min="0" step="1000" placeholder="128000">
+              <label for="cfg-context-cap-preset" title="写入各接入工具时给未单独设窗口的模型收紧最大上下文，促使其早触发压缩，避免单轮十万级 Token 瞬间耗光免费额度；默认表示不限制，单独设过窗口的模型不受影响">客户端上下文上限</label>
+              <select id="cfg-context-cap-preset" class="cap-input" aria-label="客户端上下文上限档位">
+                <option value="default">默认</option>
+                <option value="131072">128k</option>
+                <option value="262144">256k</option>
+                <option value="524288">512k</option>
+                <option value="1048576">1m</option>
+                <option value="custom">自定义</option>
+              </select>
+              <input id="cfg-context-cap" class="cap-input" type="number" min="1024" max="10000000" step="1000" placeholder="128000" hidden aria-label="自定义上下文上限（Token 数）">
               <button id="cfg-cap-save" class="mini" type="button">应用上限</button>
               <label class="check" title="开启后仅提取本机 OpenCode 的 opencode 账号登录态到隔离区，绝不带入第三方付费 API Key；如你的 opencode 账号充过付费额度请谨慎开启。改完需重启服务生效">
                 <input id="cfg-share-auth" type="checkbox">

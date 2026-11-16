@@ -1844,9 +1844,7 @@ async function loadSettings() {
   byId('cfg-ttl').value = s.probeTtlMinutes;
   byId('cfg-concurrency').setAttribute('aria-invalid', 'false');
   byId('cfg-ttl').setAttribute('aria-invalid', 'false');
-  const capInput = byId('cfg-context-cap');
-  capInput.value = s.targetContextCap ?? 0;
-  capInput.setAttribute('aria-invalid', 'false');
+  renderContextCapSelect(s.targetContextCap ?? null);
   byId('cfg-share-auth').checked = Boolean(s.shareOpencodeAuth);
   note('', 'ok', action);
 }
@@ -1882,24 +1880,43 @@ async function saveSettings() {
   note('设置已保存', 'ok', action);
 }
 
-async function saveContextCap() {
-  const capInput = byId('cfg-context-cap');
-  const raw = String(capInput.value ?? '').trim();
-  const num = raw === '' ? 0 : Number(raw);
-  const invalid = raw !== '' && (!Number.isInteger(num) || (num !== 0 && (num < 1024 || num > 10000000)));
-  const action = beginAction('settings:cap');
+/** 上下文上限下拉的预设档位。1m 取 1048576，与 Claude Code 的 1M 口径一致。 */
+const CAP_PRESETS = [131072, 262144, 524288, 1048576];
 
-  capInput.setAttribute('aria-invalid', String(invalid));
-  if (invalid) {
-    note('客户端上下文上限无效：请填写 0（不限制）或 1024–10000000 的整数。', 'error', action);
-    return;
+/** 把已保存的上限值回填成「下拉档位 + 输入框显隐」；不在预设里的整数按自定义显示。 */
+function renderContextCapSelect(cap) {
+  const preset = byId('cfg-context-cap-preset');
+  const input = byId('cfg-context-cap');
+  preset.value = cap == null ? 'default' : (CAP_PRESETS.includes(cap) ? String(cap) : 'custom');
+  input.hidden = preset.value !== 'custom';
+  input.value = preset.value === 'custom' ? cap : '';
+  input.setAttribute('aria-invalid', 'false');
+}
+
+async function saveContextCap() {
+  const preset = byId('cfg-context-cap-preset');
+  const capInput = byId('cfg-context-cap');
+  const action = beginAction('settings:cap');
+  let cap = null;
+
+  if (preset.value === 'custom') {
+    const raw = String(capInput.value ?? '').trim();
+    const num = raw === '' ? 0 : Number(raw);
+    const invalid = !Number.isInteger(num) || num < 1024 || num > 10000000;
+    capInput.setAttribute('aria-invalid', String(invalid));
+    if (invalid) {
+      note('自定义上下文上限无效：请填写 1024–10000000 的整数（Token 数）。', 'error', action);
+      return;
+    }
+    cap = num;
+  } else if (preset.value !== 'default') {
+    cap = Number(preset.value);
   }
 
-  const saved = await call('保存客户端上下文上限', () => window.oc.saveSettings({ targetContextCap: num === 0 ? null : num }), action);
+  const saved = await call('保存客户端上下文上限', () => window.oc.saveSettings({ targetContextCap: cap }), action);
   if (!saved) return;
   clearNotice('settings:read');
-  capInput.value = saved.targetContextCap ?? 0;
-  capInput.setAttribute('aria-invalid', 'false');
+  renderContextCapSelect(saved.targetContextCap ?? null);
   note(
     saved.targetContextCap
       ? `客户端上下文上限已设为 ${saved.targetContextCap}（后续写入或重载目标配置生效）`
@@ -2218,6 +2235,13 @@ function wire() {
     });
   }
   byId('cfg-cap-save').addEventListener('click', saveContextCap);
+  byId('cfg-context-cap-preset').addEventListener('change', (event) => {
+    const input = byId('cfg-context-cap');
+    const custom = event.currentTarget.value === 'custom';
+    input.hidden = !custom;
+    if (custom) input.focus();
+    clearNotice('settings:cap');
+  });
   byId('cfg-context-cap').addEventListener('input', (event) => {
     event.currentTarget.setAttribute('aria-invalid', 'false');
     clearNotice('settings:cap');
