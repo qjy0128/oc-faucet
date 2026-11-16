@@ -240,6 +240,7 @@ export async function startWebUi({
         ...(body.probeTtlMinutes !== undefined ? { probeTtlMinutes: body.probeTtlMinutes } : {}),
         ...(body.targetContextCap !== undefined ? { targetContextCap: body.targetContextCap } : {}),
         ...(body.shareOpencodeAuth !== undefined ? { shareOpencodeAuth: body.shareOpencodeAuth } : {}),
+        ...(body.opencodeAutoUpdate !== undefined ? { opencodeAutoUpdate: body.opencodeAutoUpdate } : {}),
       }),
 
     // 切换上游方案（内嵌 ⇄ 伪装）。忙拒（409）与失败回滚都在桥里做，

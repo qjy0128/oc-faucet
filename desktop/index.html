@@ -178,6 +178,10 @@
                 <input id="cfg-share-auth" type="checkbox">
                 <span>复用本机 OpenCode 登录态（需重启服务）</span>
               </label>
+              <label class="check" title="服务就绪后定期对照 npm 上的最新版；有新版就用官方 opencode upgrade 自动升级并重启服务换新版。显式指定过 OpenCode 路径（OCF_OPENCODE_PATH）时不动它">
+                <input id="cfg-opencode-update" type="checkbox">
+                <span>自动更新 OpenCode<span id="opencode-version" class="hint"></span></span>
+              </label>
             </div>
           </div>
         </details>

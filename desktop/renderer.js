@@ -1406,8 +1406,28 @@ function applySnapshot(next) {
   }
   snapshot = next;
   stateRevision += 1;
+  renderOpencodeUpdateHint(next.opencodeUpdate);
   render();
   return true;
+}
+
+/** 设置区「自动更新 OpenCode」后面的版本状态小字；状态语义见 src/opencode-update.js */
+function renderOpencodeUpdateHint(update) {
+  const el = byId('opencode-version');
+  if (!el) return;
+  if (!update || typeof update !== 'object' || !update.version) {
+    el.textContent = '';
+    return;
+  }
+  const suffix = {
+    latest: ' · 已是最新',
+    upgrading: update.latest ? ` → v${update.latest} · 升级中…` : ' · 升级中…',
+    upgraded: ` · 已升级`,
+    error: ' · 巡检失败，稍后再试',
+    off: ' · 自动更新已关',
+    'manual-path': ' · 手动指定路径，不自动更新',
+  }[update.status] ?? '';
+  el.textContent = `（v${update.version}${suffix}）`;
 }
 
 function handleWebConnectionError(error) {
@@ -1846,7 +1866,27 @@ async function loadSettings() {
   byId('cfg-ttl').setAttribute('aria-invalid', 'false');
   renderContextCapSelect(s.targetContextCap ?? null);
   byId('cfg-share-auth').checked = Boolean(s.shareOpencodeAuth);
+  byId('cfg-opencode-update').checked = s.opencodeAutoUpdate !== false;
   note('', 'ok', action);
+}
+
+/** OpenCode 自动更新开关：单独保存，立即生效（下一轮巡检按新开关走） */
+async function toggleOpencodeUpdate() {
+  const checkbox = byId('cfg-opencode-update');
+  const next = Boolean(checkbox.checked);
+  const action = beginAction('settings:opencode-update');
+  const saved = await call('保存 OpenCode 自动更新开关', () => window.oc.saveSettings({ opencodeAutoUpdate: next }), action);
+  if (!saved) {
+    checkbox.checked = !next;
+    return;
+  }
+  note(
+    saved.opencodeAutoUpdate !== false
+      ? '已开启 OpenCode 自动更新：服务就绪后自动巡检新版，有就升级并重启服务。'
+      : '已关闭 OpenCode 自动更新，本机 OpenCode 保持当前版本。',
+    'ok',
+    action,
+  );
 }
 
 async function saveSettings() {
@@ -2247,6 +2287,7 @@ function wire() {
     clearNotice('settings:cap');
   });
   byId('cfg-share-auth').addEventListener('change', toggleShareAuth);
+  byId('cfg-opencode-update').addEventListener('change', toggleOpencodeUpdate);
 
   // 状态栏的 BaseURL 复制；转发口没起来时按钮是灰的，走不到这里
   byId('act-copy-endpoint').addEventListener('click', async (event) => {

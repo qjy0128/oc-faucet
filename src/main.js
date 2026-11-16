@@ -23,6 +23,8 @@ import {
   parseModelId,
 } from './models.js';
 import { inspectOpencodeEnv } from './opencode-env.js';
+import { createAutoUpdater } from './opencode-update.js';
+import { findOpencodeExecutable } from './oc-client.js';
 import { describeReasoning } from './efforts.js';
 import { PROBE_FINGERPRINT, probeMany } from './probe.js';
 import { ProbeCache } from './probe-cache.js';
@@ -94,6 +96,19 @@ export class Bridge {
     // 上游客户端工厂：默认按方案造真的（内嵌 OpenCode / Bun 侧车直连 zen）；
     // makeClient 参数是留给测试的另一条缝（塞假客户端，不触网不起进程）
     this.#clientFactory = makeClient ?? ((mode, options) => this.#makeClient(mode, options));
+    // OpenCode 自动更新器：只在 embedded 方案下排期；state 挂到快照给面板显示
+    this.#opencodeUpdater = createAutoUpdater({
+      locate: () => {
+        const explicit = this.client?.opencodePath ?? process.env.OCF_OPENCODE_PATH;
+        const { found } = findOpencodeExecutable(typeof explicit === 'string' && explicit ? explicit : undefined);
+        return found ? { path: found, explicit: typeof explicit === 'string' && Boolean(explicit) } : null;
+      },
+      isEnabled: async () => (await settings.readSettings()).opencodeAutoUpdate !== false,
+      log: (line) => this.log(line),
+      onUpgraded: async () => {
+        await this.restart();
+      },
+    });
     this.#inspectOpencode = inspectOpencode ?? inspectOpencodeEnv;
     // 失败自动重试的节奏（默认 30 分钟，避免后台静默探活频繁消耗共享免费池日限额；测试可调小）
     this.autoRetryIntervalMs =
@@ -113,6 +128,8 @@ export class Bridge {
       apiKey: null,
       // 路由器广播：true = 转发口绑 0.0.0.0，局域网设备凭密钥接入
       lanAccess: false,
+      // OpenCode 自动更新的巡检状态（引用 updater 内部的 state，实时变）
+      opencodeUpdate: this.#opencodeUpdater.state,
       upstream: { ready: false, baseUrl: null },
       opencode: null, // 本机 OpenCode 安装与独立运行状态
       startedAt: Date.now(),
@@ -251,6 +268,7 @@ export class Bridge {
   }
 
   #clientFactory;
+  #opencodeUpdater;
   #inspectOpencode;
   #opencodeCheckedAt = 0;
   #opencodeCheckPromise = null;
@@ -355,6 +373,9 @@ export class Bridge {
       this.state.phase = 'ready';
       this.log(`OC Faucet 已就绪：转发口 http://127.0.0.1:${this.state.port}`);
       this.#startAutoRetry();
+      // 内嵌方案才有「升级本机 OpenCode」一说；先让服务跑起来，15 秒后再异步巡检，
+      // 有新版就自动升级并重启服务换新版（显式指定过路径的只提示不动手）。
+      if (this.state.mode === 'embedded') this.#opencodeUpdater.schedule(15_000);
 
       // 端口先开着，再用缓存里的体检结论把模型恢复出来（不发请求、不花额度）。
       // 放在 listen 之后：这一步要问上游，失败了也不该让端口起不来。
@@ -529,6 +550,9 @@ export class Bridge {
 
     // 判定按方案分开记：清掉旧的，从缓存按新方案的指纹恢复（不发请求、不花额度）
     this.state.verdicts.clear();
+    // 热切换不经过 start()：内嵌方案在这里补排 OpenCode 自动更新巡检；切去伪装则停掉
+    if (mode === 'embedded') this.#opencodeUpdater.schedule(15_000);
+    else this.#opencodeUpdater.cancel();
     try {
       const restored = await this.restore();
       const available = this.getModels().length;
@@ -689,6 +713,7 @@ export class Bridge {
    */
   async stop({ uninstall = true } = {}) {
     this.#stopAutoRetry();
+    this.#opencodeUpdater.cancel();
     if (uninstall) await this.#uninstallWrittenTargets();
     if (this.server) {
       const server = this.server;
@@ -1743,6 +1768,11 @@ export class Bridge {
     if (patch && Object.hasOwn(patch, 'shareOpencodeAuth')) {
       if (typeof patch.shareOpencodeAuth !== 'boolean') {
         throw new BridgeError('复用本机 OpenCode 登录态开关只接受 true 或 false。', 400, 'invalid_share_opencode_auth');
+      }
+    }
+    if (patch && Object.hasOwn(patch, 'opencodeAutoUpdate')) {
+      if (typeof patch.opencodeAutoUpdate !== 'boolean') {
+        throw new BridgeError('OpenCode 自动更新开关只接受 true 或 false。', 400, 'invalid_opencode_auto_update');
       }
     }
     const previousCap = this.state.targetContextCap;

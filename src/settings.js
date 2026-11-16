@@ -113,6 +113,8 @@ const DEFAULTS = {
   targetContextCap: 128000,
   // 显式开启时才把本机 OpenCode auth.json 里的 `opencode` 条目同步进隔离环境；绝不带入其它供应商凭据
   shareOpencodeAuth: false,
+  // 自动检测本机 OpenCode CLI 的新版并升级（官方 `opencode upgrade`；显式指定过路径的不动）
+  opencodeAutoUpdate: true,
 };
 
 function cloneDefaults() {
@@ -245,6 +247,7 @@ function sanitize(s) {
     blockedModels: sanitizeBlockedModels(s.blockedModels),
     targetContextCap: sanitizeTargetContextCap(s.targetContextCap, DEFAULTS.targetContextCap),
     shareOpencodeAuth: typeof s.shareOpencodeAuth === 'boolean' ? s.shareOpencodeAuth : DEFAULTS.shareOpencodeAuth,
+    opencodeAutoUpdate: typeof s.opencodeAutoUpdate === 'boolean' ? s.opencodeAutoUpdate : DEFAULTS.opencodeAutoUpdate,
   };
 }
 
