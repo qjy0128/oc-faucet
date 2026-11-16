@@ -204,13 +204,43 @@ test('写入：modelPicker 把所选模型列进 /model 菜单，行尾带 model
   });
 });
 
-test('modelPicker：用户自己写的菜单不覆盖、不摘除', async (t) => {
-  const userPicker = { options: [{ model: 'my-org/my-model', label: '我的', description: '自己的菜单' }] };
-  const { file, target } = await withDir(t, { modelPicker: userPicker });
+test('modelPicker：用户自己写的菜单行不覆盖不删，我方行追加，卸载后只剩用户行', async (t) => {
+  const userRow = { model: 'my-org/my-model', label: '我的', description: '自己的菜单' };
+  const { file, target } = await withDir(t, { modelPicker: { options: [userRow] } });
   await target.install(MODELS, OPTS);
-  assert.deepEqual((await read(file)).modelPicker, userPicker);
+  const merged = (await read(file)).modelPicker.options;
+  assert.deepEqual(merged[0], userRow, '用户的行还在第一位');
+  assert.deepEqual(merged.slice(1).map((row) => row.description), ['via modelOC', 'via modelOC'], '我们的行追加在后');
+
   await target.uninstall();
-  assert.deepEqual((await read(file)).modelPicker, userPicker);
+  assert.deepEqual((await read(file)).modelPicker, { options: [userRow] }, '卸载后只剩用户自己的行');
+});
+
+test('四档映射键（fable/opus/sonnet/haiku）：安装与卸载全程不碰', async (t) => {
+  const tiers = {
+    ANTHROPIC_DEFAULT_FABLE_MODEL: 'zenmux/anthropic/claude-fable-5-1:high[1m]',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'zenmux/anthropic/claude-opus-5-5:high[1m]',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'zenmux/deepseek/deepseek-v4.1-flash:max[1m]',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'zenmux/deepseek/deepseek-v4.1-flash:max[1m]',
+  };
+  const { file, target } = await withDir(t, { env: { ...tiers } });
+  await target.install(MODELS, OPTS);
+  const written = await read(file);
+  for (const [key, value] of Object.entries(tiers)) {
+    assert.equal(written.env[key], value, `安装不动 ${key}`);
+  }
+
+  // 装好之后用户改过四档取值：卸载必须保留用户的新值
+  const edited = await read(file);
+  edited.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'user/own-pick';
+  await writeFile(file, JSON.stringify(edited, null, 2));
+
+  await target.uninstall();
+  const restored = await read(file);
+  assert.equal(restored.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'user/own-pick', '用户改过的四档值保留');
+  assert.equal(restored.env.ANTHROPIC_DEFAULT_FABLE_MODEL, tiers.ANTHROPIC_DEFAULT_FABLE_MODEL);
+  assert.equal(restored.env.ANTHROPIC_DEFAULT_SONNET_MODEL, tiers.ANTHROPIC_DEFAULT_SONNET_MODEL);
+  assert.equal(restored.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, tiers.ANTHROPIC_DEFAULT_HAIKU_MODEL);
 });
 
 test('modelPicker：重装时更新我方菜单，卸载后整个摘掉', async (t) => {

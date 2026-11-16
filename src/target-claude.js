@@ -16,6 +16,13 @@
  *
  * 归属与还原：要求本机地址和专用标记同时匹配；写入前先可靠落盘被覆盖的原值。
  * 快照丢失或损坏时拒绝安装/卸载，避免把已写入的值误当成用户原配置。
+ *
+ * 两样东西永远不碰：
+ *   - 四档映射键 env.ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL——Claude Code
+ *     用它们把 fable/opus/sonnet/haiku 四个档位映射到具体模型（用户可能经别的网关配过），
+ *     安装/摘除一律不写、不记档、不还原；
+ *   - modelPicker.options 做行级合并：不带我们签名的行（四档行、用户行、别的工具写的行）
+ *     只保留不覆盖，我们只增删/更新带签名的自家行，摘除后剩余行原样留下。
  */
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -36,6 +43,16 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh'];
 const PICKER_PATH = ['modelPicker'];
 /** /model 菜单行的归属签名：每行 description 都以它结尾。 */
 const PICKER_NOTE = 'via modelOC';
+/**
+ * Claude Code 的四档映射键（fable/opus/sonnet/haiku → 具体模型）。用户可能经别的
+ * 网关（如 magpie）把档位映射到自己的模型——那是用户的资产，安装/摘除一律不碰。
+ */
+const TIER_ENV_KEYS = [
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+];
 
 function expandHome(value) {
   if (value === '~') return homedir();
@@ -125,14 +142,11 @@ function pickerRows(models) {
   }));
 }
 
-/** 这份 modelPicker 是不是我们写的：每行 description 都带 modelOC 签名。 */
-function isModelOCPicker(value) {
-  if (!isPlainObject(value)) return false;
-  const rows = value.options;
-  if (!Array.isArray(rows) || rows.length === 0) return false;
-  return rows.every((row) => isPlainObject(row)
+/** 这一行菜单是不是我们写的：description 以签名结尾。行级认领，别家（用户/自带/其它工具）的行不认。 */
+function isOurPickerRow(row) {
+  return isPlainObject(row)
     && typeof row.model === 'string' && row.model
-    && typeof row.description === 'string' && row.description.endsWith(PICKER_NOTE));
+    && typeof row.description === 'string' && row.description.endsWith(PICKER_NOTE);
 }
 
 function isPlainObject(value) {
@@ -283,28 +297,35 @@ function releaseOwnedSetting(settings, owner, path) {
 }
 
 /**
- * 写 modelPicker 进快照与配置。与 saveOwnedSetting 的差别：现值只要还带 modelOC
- * 签名，哪怕和上次写入不同（用户手改过行、或旧版本写的），original 也不取它——
- * 否则卸载会把它还原成一份过期的我方菜单。
+ * /model 菜单行级合并：不带签名的行（Claude Code 自带档位行、用户行、别的工具写的行）
+ * 原样保留，带签名的自家行换成这次的清单。绝不整份替换——用户的菜单行丢了就找不回来。
  */
-function saveOwnedPicker(settings, owner, rows) {
-  const key = pathKey(PICKER_PATH);
-  const state = { present: true, value: { options: rows } };
-  let entry = owner.keys[key];
+function mergePickerRows(settings, rows) {
   const current = readPathState(settings, PICKER_PATH);
-  if (!entry) {
-    entry = {
-      path: [...PICKER_PATH],
-      original: current.present && isModelOCPicker(current.value) ? absentState() : current,
-      applied: null,
-    };
-    owner.keys[key] = entry;
-  } else if (entry.applied && !sameState(current, entry.applied) && !isModelOCPicker(current.value)) {
-    entry.original = current;
+  const base = current.present && isPlainObject(current.value) ? current.value : {};
+  const keptRows = Array.isArray(base.options) ? base.options.filter((row) => !isOurPickerRow(row)) : [];
+  writePathState(settings, PICKER_PATH, { present: true, value: { ...base, options: [...keptRows, ...rows] } });
+}
+
+/**
+ * /model 菜单行级摘除：只删带签名的自家行，其余行原样留下。我们的行删完 options
+ * 就空了——options 摘掉，modelPicker 里没有别的字段就连键一起删（不留空壳）。
+ */
+function removeOurPickerRows(settings) {
+  const current = readPathState(settings, PICKER_PATH);
+  if (!current.present || !isPlainObject(current.value) || !Array.isArray(current.value.options)) return false;
+  const rows = current.value.options;
+  const keptRows = rows.filter((row) => !isOurPickerRow(row));
+  if (keptRows.length === rows.length) return false; // 一行都不是我们的，不动
+  if (keptRows.length > 0) {
+    writePathState(settings, PICKER_PATH, { present: true, value: { ...current.value, options: keptRows } });
+    return true;
   }
-  writePathState(settings, PICKER_PATH, state);
-  entry.applied = state;
-  delete entry.legacy;
+  const rest = { ...current.value };
+  delete rest.options;
+  if (Object.keys(rest).length > 0) writePathState(settings, PICKER_PATH, { present: true, value: rest });
+  else writePathState(settings, PICKER_PATH, absentState());
+  return true;
 }
 
 function assertSnapshotCoversConfig(settings, owner, file) {
@@ -347,6 +368,10 @@ function applyPatch(settings, models, { port, apiKey }, owner) {
     [['env', OWNER_ENV_KEY], OWNER_ENV_VALUE],
     [['model'], models[0].id],
   ];
+  // 防御：四档映射键永远不许进写入清单（见 TIER_ENV_KEYS 注释）——将来谁往这里加就当场炸出来
+  if (writes.some(([path]) => path[0] === 'env' && TIER_ENV_KEYS.includes(path[1]))) {
+    throw new BridgeError('内部错误：不许写入 Claude Code 的档位映射键', 500, 'claude_tier_keys');
+  }
   for (const [path, value] of writes) {
     saveOwnedSetting(next, owner, path, value);
   }
@@ -360,11 +385,8 @@ function applyPatch(settings, models, { port, apiKey }, owner) {
     saveOwnedSetting(next, owner, path, value);
   }
 
-  // /model 菜单：用户自己写过 modelPicker 就整份让位（与 Magpie 一致），否则换成我们的行。
-  const picker = readPathState(next, PICKER_PATH);
-  if (!picker.present || isModelOCPicker(picker.value)) {
-    saveOwnedPicker(next, owner, pickerRows(models));
-  }
+  // /model 菜单行级合并：四档行/用户行/别家工具的行保留，我们的行追加或更新
+  mergePickerRows(next, pickerRows(models));
   return next;
 }
 
@@ -448,17 +470,12 @@ export function createClaudeTarget(overrides = {}) {
       if (!snapshot.exists) throw ownerSnapshotError(snapshotFile, '不存在');
       const owner = snapshot.owner;
       assertSnapshotCoversConfig(settings, owner, snapshotFile);
-      // 快照缺 modelPicker 记录、但配置里的菜单确带 modelOC 签名时（如快照被手工裁过），
-      // 补一条「原值不存在」，让通用还原逻辑把它摘掉（对齐 Magpie 靠签名认领的做法）。
-      const picker = readPathState(settings, PICKER_PATH);
-      if (picker.present && isModelOCPicker(picker.value) && !owner.keys[pathKey(PICKER_PATH)]) {
-        owner.keys[pathKey(PICKER_PATH)] = {
-          path: [...PICKER_PATH],
-          original: absentState(),
-          applied: { present: true, value: picker.value },
-        };
-      }
+      // 先按快照还原 env/model 等受管键（用户改过的键保留现状），再做菜单行级清理。
+      // 旧版快照若带整份 modelPicker 条目，restore 只会还原「仍等于旧版整份」的菜单，
+      // 混合状态交给下面的行级摘除收拾——两种快照最终都收敛到「只剩用户自己的行」。
       const next = restoreOwnedKeys(settings, owner);
+      removeOurPickerRows(next);
+      delete owner.keys[pathKey(PICKER_PATH)];
       const write = await writeTextIfChanged(file, `${JSON.stringify(next, null, 2)}\n`);
       await writeOwnerSnapshot(snapshotFile, emptyOwnerSnapshot());
       return { removed: 1, changed: write.changed };

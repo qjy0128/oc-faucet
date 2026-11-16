@@ -161,7 +161,7 @@ test('摘除：原值快照丢失或损坏时拒绝删除配置和目录', async
   }
 });
 
-test('改动受管块后：状态显示未写入，重装和摘除都拒绝覆盖', async (t) => {
+test('改动受管 provider 表后：状态显示未写入，重装和摘除都拒绝覆盖', async (t) => {
   const { file, catalogPath, target } = await withDir(t, 'model = "gpt-original"\n');
   await target.install(MODELS, OPTS);
   const beforeCatalog = await text(catalogPath);
@@ -169,10 +169,74 @@ test('改动受管块后：状态显示未写入，重装和摘除都拒绝覆�
   await writeFile(file, edited);
 
   assert.deepEqual(await target.status(), { written: false, models: [] });
-  await assert.rejects(() => target.install(MODELS, { ...OPTS, apiKey: 'ocf-other-key' }), /受管内容已被改动/);
-  await assert.rejects(() => target.uninstall(), /受管内容已被改动/);
+  await assert.rejects(() => target.install(MODELS, { ...OPTS, apiKey: 'ocf-other-key' }), /受管 provider 表已被改动/);
+  await assert.rejects(() => target.uninstall(), /受管 provider 表已被改动/);
   assert.equal(await text(file), edited);
   assert.equal(await text(catalogPath), beforeCatalog);
+});
+
+test('条件还原：用户改过顶层 model 值后摘除，保留用户的值、只摘我方内容', async (t) => {
+  const { file, ownerFile, target } = await withDir(t, 'model = "gpt-original"\n\n[features]\nx = true\n');
+  await target.install(MODELS, OPTS);
+  // 用户在装好之后自己改了顶层 model（在受管块里改值）
+  const edited = (await text(file)).replace(`model = "${MODEL_TOOL.id}"`, 'model = "gpt-5.2"');
+  await writeFile(file, edited);
+
+  // 状态仍认「我们写过」（provider 表没动），摘除不报错
+  assert.equal((await target.status()).written, true);
+  const result = await target.uninstall();
+  assert.equal(result.removed, 1);
+  const restored = await text(file);
+  assert.match(restored, /model = "gpt-5\.2"/, '用户改过的顶层值原样保留');
+  assert.doesNotMatch(restored, /oc-faucet/, '我们的受管块与 provider 表摘干净');
+  assert.doesNotMatch(restored, /model_provider/, 'model_provider 无原值可还原且非用户所写，不留');
+  assert.match(restored, /\[features\]\nx = true/, '用户自己的表原样保留');
+  assert.equal(JSON.parse(await text(ownerFile)).model, undefined, '快照清空');
+});
+
+test('条件还原：用户改过顶层 model 值后重装，吸收用户的值为应还原原值', async (t) => {
+  const { file, target } = await withDir(t, 'model = "gpt-original"\n');
+  await target.install(MODELS, OPTS);
+  const edited = (await text(file)).replace(`model = "${MODEL_TOOL.id}"`, 'model = "gpt-5.2"');
+  await writeFile(file, edited);
+
+  await target.install([MODEL_PLAIN], OPTS);
+  const rewritten = await text(file);
+  assert.match(rewritten, new RegExp(`model = "${MODEL_PLAIN.id.replace('/', '\\/')}"`), '重装写回我们的模型');
+  assert.equal(rewritten.match(/^model = /gm)?.length, 1, '同一顶层键只出现一次');
+
+  await target.uninstall();
+  const restored = await text(file);
+  assert.match(restored, /model = "gpt-5\.2"/, '摘除还原的是用户改过的值，不是最初的 gpt-original');
+});
+
+test('条件还原：用户在受管块外写同名顶层键，重装吸收、摘除保留', async (t) => {
+  const { file, target } = await withDir(t, 'model = "gpt-original"\n');
+  await target.install(MODELS, OPTS);
+  // 用户把受管顶层块整个删了、自己在文件头写了 model（重复键风险由重装化解）
+  const withoutTopBlock = (await text(file)).replace(/# >>> oc-faucet >>>\nmodel = "[^"]+"\nmodel_provider = "[^"]+"\nmodel_catalog_json = "[^"]+"\n# <<< oc-faucet <<<\n\n?/, '');
+  await writeFile(file, `model = "user-pick"\n${withoutTopBlock}`);
+
+  await target.install(MODELS, OPTS);
+  const rewritten = await text(file);
+  assert.equal(rewritten.match(/^model = /gm)?.length, 1, '重装后同一顶层键只出现一次（TOML 才合法）');
+  await target.uninstall();
+  const restored = await text(file);
+  assert.match(restored, /model = "user-pick"/, '用户块外的行保留');
+  assert.doesNotMatch(restored, /oc-faucet/);
+});
+
+test('条件还原：用户在块外写同名顶层键后直接摘除（不重装），行原样保留', async (t) => {
+  const { file, target } = await withDir(t, 'model = "gpt-original"\n');
+  await target.install(MODELS, OPTS);
+  const withoutTopBlock = (await text(file)).replace(/# >>> oc-faucet >>>\nmodel = "[^"]+"\nmodel_provider = "[^"]+"\nmodel_catalog_json = "[^"]+"\n# <<< oc-faucet <<<\n\n?/, '');
+  await writeFile(file, `model = "user-pick"\n${withoutTopBlock}`);
+
+  await target.uninstall();
+  const restored = await text(file);
+  assert.match(restored, /model = "user-pick"/, '用户块外的行原样保留');
+  assert.equal(restored.match(/^model = /gm)?.length, 1, '不与快照还原行重复');
+  assert.doesNotMatch(restored, /oc-faucet/, '受管内容摘干净');
 });
 
 test('受管标记仍在但原值快照丢失：重装不能把当前受管值当原值', async (t) => {
@@ -186,14 +250,34 @@ test('受管标记仍在但原值快照丢失：重装不能把当前受管值�
   assert.equal(await text(file), managed);
 });
 
-test('标记丢失且顶层值不等于原值快照：拒绝重新认领当前值', async (t) => {
+test('顶层块标记被删（新快照）：重装不认领受管值，摘除还原旧原值', async (t) => {
   const { file, target } = await withDir(t, 'model = "gpt-original"\n');
   await target.install(MODELS, OPTS);
-  const edited = (await text(file)).replaceAll('# >>> oc-faucet >>>\n', '').replaceAll('# <<< oc-faucet <<<\n', '');
-  await writeFile(file, edited);
+  // 只删顶层块的两行标记：三行受管值裸露在块外，provider 表完好
+  const lines = (await text(file)).split('\n');
+  const beginIdx = lines.indexOf('# >>> oc-faucet >>>');
+  const endIdx = lines.indexOf('# <<< oc-faucet <<<');
+  const stripped = [...lines.slice(0, beginIdx), ...lines.slice(beginIdx + 1, endIdx), ...lines.slice(endIdx + 1)].join('\n');
+  await writeFile(file, stripped);
 
-  await assert.rejects(() => target.install(MODELS, OPTS), /受管标记已丢失/);
-  assert.equal(await text(file), edited);
+  await target.install(MODELS, OPTS); // 重装成功：受管值不是用户原值，不认领
+  await target.uninstall();
+  const restored = await text(file);
+  assert.match(restored, /model = "gpt-original"/, '还原的是最初的用户原值，而不是我们的受管值');
+  assert.doesNotMatch(restored, /oc-faucet/);
+});
+
+test('顶层块被改且快照没记写入值（旧版快照）：拒绝动手', async (t) => {
+  const { file, ownerFile, target } = await withDir(t, 'model = "gpt-original"\n');
+  await target.install(MODELS, OPTS);
+  // 把快照降级成旧版（没有 topApplied），再让用户改顶层块里的值
+  const snapshot = JSON.parse(await text(ownerFile));
+  delete snapshot.__ocFaucetCodex.topApplied;
+  await writeFile(ownerFile, JSON.stringify(snapshot));
+  await writeFile(file, (await text(file)).replace(`model = "${MODEL_TOOL.id}"`, 'model = "user-pick"'));
+
+  await assert.rejects(() => target.install(MODELS, OPTS), /旧版快照没有记录/);
+  await assert.rejects(() => target.uninstall(), /旧版快照没有记录/);
 });
 
 test('摘除：目录文件一并删掉', async (t) => {

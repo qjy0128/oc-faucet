@@ -13,7 +13,14 @@
  * 为什么要目录 JSON：Codex 对认不出的模型只用兜底元数据，窗口上限被夹在 272k；
  * `model_catalog_json` 是申报自定义窗口的唯一官方途径，代价是它会顶掉 Codex 内置
  * 模型清单——所以摘除时必须把这三行连引用一起撤掉，并还原用户原本的同名配置。
- * 被我们盖掉的用户顶层取值先记进本机快照，移除时按快照还原。
+ *
+ * 归属与还原（对齐 Claude Code 目标的「条件还原」纪律）：
+ *   - provider 表块（②）是纯我们的地盘，快照记其 sha256；被改过说明用户接手了，
+ *     安装/摘除都报错不动手；
+ *   - 顶层块（①）允许用户改动：快照记我们写入的 model 取值（topApplied），逐行
+ *     分清「我们的 / 你的」。安装时你改过的值吸收为将来要还原的原值；摘除时你的
+ *     行原样保留，只有空着的键才按快照还原安装前原值——绝不覆盖你的更新；
+ *   - 旧版快照（没记 topApplied）遇顶层块被改：分不清归属，保持报错拒绝动手。
  */
 import { existsSync } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
@@ -212,22 +219,6 @@ function providerBlockLines({ port, apiKey }) {
   ];
 }
 
-/** 读取顶层用户原值；重复键无法无损还原，因此安全拒绝。 */
-function takeUserTopLines(found, file) {
-  const originals = {};
-  const drop = new Set();
-  const firstHeader = found.lines.findIndex((line) => line.isHeader);
-  const limit = firstHeader < 0 ? found.lines.length : firstHeader;
-  found.lines.forEach((line, index) => {
-    if (index >= limit || line.commentOnly || found.inBlock(index) || !line.key) return;
-    if (!TOP_KEYS.includes(line.key)) return;
-    if (line.key in originals) throw configError(file, `里的顶层键 ${line.key} 重复，无法安全留档`);
-    originals[line.key] = line.raw;
-    drop.add(index);
-  });
-  return { originals, drop };
-}
-
 function hashManagedBlocks(found) {
   return found.starts.map((start, position) => {
     const block = found.lines.slice(start, found.ends[position] + 1).map((line) => line.raw).join('\n');
@@ -238,6 +229,13 @@ function hashManagedBlocks(found) {
 function isHashList(value) {
   return Array.isArray(value) && value.length === 2
     && value.every((hash) => typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash));
+}
+
+function validTopApplied(value) {
+  return value === undefined
+    || (typeof value === 'object' && value !== null && !Array.isArray(value)
+      && Object.keys(value).every((key) => key === 'model')
+      && (value.model === undefined || (typeof value.model === 'string' && value.model)));
 }
 
 function validateOwnerSnapshot(value) {
@@ -258,7 +256,8 @@ function validateOwnerSnapshot(value) {
   if (meta.pendingManagedBlocks !== undefined && !hasPending) return null;
   if (meta.state === 'prepared' && (hasCurrent || !hasPending)) return null;
   if (meta.state === 'installed' && !hasCurrent) return null;
-  const allowedMetaKeys = new Set(['version', 'state', 'managedBlocks', 'pendingManagedBlocks']);
+  if (!validTopApplied(meta.topApplied)) return null;
+  const allowedMetaKeys = new Set(['version', 'state', 'managedBlocks', 'pendingManagedBlocks', 'topApplied']);
   if (Object.keys(meta).some((key) => !allowedMetaKeys.has(key))) return null;
   return { ...value };
 }
@@ -281,31 +280,126 @@ async function readOwnerRecord(file) {
   return { present: true, valid: owner !== null, owner };
 }
 
-function hasManagedSnapshot(found, owner) {
-  if (found.starts.length !== 2) return false;
-  const meta = owner?.[OWNER_META_KEY];
-  if (!meta) return false;
-  const actual = hashManagedBlocks(found);
-  return [meta.managedBlocks, meta.pendingManagedBlocks]
-    .some((expected) => isHashList(expected) && expected.every((hash, index) => hash === actual[index]));
+/** 受管块按内容认类型：块内有 TOP_KEYS 赋值是顶层块，有 [model_providers.oc-faucet] 是 provider 表块。 */
+function blockKindAt(found, position) {
+  for (let index = found.starts[position]; index <= found.ends[position]; index += 1) {
+    const line = found.lines[index];
+    if (!line.commentOnly && line.isHeader && line.raw.trim() === `[model_providers.${PROVIDER_ID}]`) return 'provider';
+    if (!line.commentOnly && line.key && TOP_KEYS.includes(line.key)) return 'top';
+  }
+  return null;
 }
 
-function assertManagedSnapshot(found, owner, file) {
-  if (!hasManagedSnapshot(found, owner)) {
-    throw configError(file, '里的受管内容已被改动，或安装前的原值快照缺失/损坏；为避免丢失配置，本次没有移除或覆盖它');
+/** 文件里的顶层块 / provider 块各自在 starts 里的位置；没有返回 -1；同类出现两个报错。 */
+function locateBlocks(found, file) {
+  const at = { top: -1, provider: -1 };
+  for (const position of found.starts.keys()) {
+    const kind = blockKindAt(found, position);
+    if (kind === null) continue;
+    if (at[kind] !== -1) throw configError(file, '里的受管标记块数量异常');
+    at[kind] = position;
+  }
+  return at;
+}
+
+/**
+ * provider 表块（纯我们的地盘）是否仍是快照记录的那一份。
+ * 安装输出恒为「顶层块在前、provider 块在后」，所以快照 hash 列表的位置 1 恒是 provider 的。
+ */
+function providerBlockIntact(found, owner, providerIdx) {
+  const meta = owner?.[OWNER_META_KEY];
+  if (!meta || providerIdx < 0) return false;
+  const actual = hashManagedBlocks(found)[providerIdx];
+  return [meta.managedBlocks, meta.pendingManagedBlocks]
+    .some((expected) => isHashList(expected) && expected[1] === actual);
+}
+
+/** 解析 `key = "value"` 行的双引号值；不是这种形状（裸标量/单引号）返回 null，按用户写法对待。 */
+function quotedValue(line) {
+  if (line.commentOnly || !line.key) return null;
+  const match = /^\s*[A-Za-z0-9_.-]+\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/.exec(stripTrailingComment(line.raw));
+  if (!match) return null;
+  try {
+    return JSON.parse(`"${match[1]}"`);
+  } catch {
+    return null;
   }
 }
 
-function assertNoUnmanagedTopKeys(found, file) {
-  const firstHeader = found.lines.findIndex((line) => line.isHeader);
-  const limit = firstHeader < 0 ? found.lines.length : firstHeader;
-  const conflict = found.lines.find((line, index) => index < limit && !found.inBlock(index)
-    && !line.commentOnly && TOP_KEYS.includes(line.key));
-  if (conflict) throw configError(file, `里的顶层键 ${conflict.key} 已在受管块外被改动`);
+/**
+ * 顶层块里这一行是不是我们写的：三键的值必须与快照记录 / 我方常量对上，标记行也算。
+ * 值对不上 = 用户改过这行 → 不算我们的，卸载时原样保留、重装时吸收为应还原原值。
+ */
+function isOurTopLine(line, appliedModel, catalogFile) {
+  const trimmed = line.raw.trim();
+  if (line.commentOnly) return trimmed === BLOCK_BEGIN || trimmed === BLOCK_END;
+  if (!line.key || !TOP_KEYS.includes(line.key)) return false;
+  const value = quotedValue(line);
+  if (line.key === 'model_provider') return value === PROVIDER_ID;
+  if (line.key === 'model_catalog_json') return value === catalogFile;
+  return appliedModel !== null && value === appliedModel;
 }
 
-function savePendingManagedBlocks(owner, currentHashes, nextHashes) {
-  owner[OWNER_META_KEY] = currentHashes
+/** 顶层受管块整块是否仍是快照记录的那份（位置 0 恒是顶层块的 hash）。 */
+function topBlockIntact(found, owner, topIdx) {
+  const meta = owner?.[OWNER_META_KEY];
+  if (!meta || topIdx < 0) return false;
+  const actual = hashManagedBlocks(found)[topIdx];
+  return [meta.managedBlocks, meta.pendingManagedBlocks]
+    .some((expected) => isHashList(expected) && expected[0] === actual);
+}
+
+/**
+ * 重排第一个受管块外表头之前的顶层区：我方行丢弃，用户行（含从顶层块里释放出来的）
+ * 按原顺序保留。返回保留行与用户写下的同名顶层行（键 → 行文本）。
+ *
+ * topBlockIdx 是顶层块在 starts 里的位置（-1 表示没有）；appliedModel 是快照记录的
+ * 「我们写入的 model 值」（旧快照没有则为 null——此时顶层块若已被改过，调用方应先报错）。
+ */
+function collectTopArea(found, { topBlockIdx, appliedModel, catalogFile, file }) {
+  // 顶层区到「第一个受管块外表头」或「任何非顶层受管块」为止——再往后是表的事，不归这里管
+  let end = found.lines.findIndex((line, index) => !found.inBlock(index) && line.isHeader);
+  if (end < 0) end = found.lines.length;
+  for (const position of found.starts.keys()) {
+    if (position !== topBlockIdx) end = Math.min(end, found.starts[position]);
+  }
+  const kept = [];
+  const userTopKeys = new Map();
+  const takeUserKeyLine = (line) => {
+    if (userTopKeys.has(line.key) && userTopKeys.get(line.key) !== line.raw) {
+      throw configError(file, `里的顶层键 ${line.key} 出现了两个不同的值，无法判断哪份是你的；请先整理后再试`);
+    }
+    userTopKeys.set(line.key, line.raw);
+  };
+  for (let index = 0; index < end; index += 1) {
+    const line = found.lines[index];
+    if (found.inBlock(index)) {
+      if (topBlockIdx >= 0 && index >= found.starts[topBlockIdx] && index <= found.ends[topBlockIdx]) {
+        if (isOurTopLine(line, appliedModel, catalogFile)) continue; // 我方行，丢弃
+        if (!line.commentOnly && line.key && TOP_KEYS.includes(line.key)) takeUserKeyLine(line);
+        else kept.push(line.raw); // 用户塞进块里的注释/其他行，原样保留
+      } else {
+        kept.push(line.raw); // 出现在表头前的其他受管块（异常形态），不拆，原样保留
+      }
+      continue;
+    }
+    if (!line.commentOnly && line.key && TOP_KEYS.includes(line.key)) takeUserKeyLine(line);
+    else kept.push(line.raw);
+  }
+  return { kept, userTopKeys };
+}
+
+/** 表区行：第一个受管块外表头起、任何受管块之外的行，原样保留。 */
+function tableAreaLines(found) {
+  const firstHeader = found.lines.findIndex((line, index) => !found.inBlock(index) && line.isHeader);
+  if (firstHeader < 0) return [];
+  return found.lines
+    .filter((line, index) => index >= firstHeader && !found.inBlock(index))
+    .map((line) => line.raw);
+}
+
+function savePendingManagedBlocks(owner, currentHashes, nextHashes, topApplied) {
+  const meta = currentHashes
     ? {
       version: OWNER_META_VERSION,
       state: 'installed',
@@ -317,6 +411,8 @@ function savePendingManagedBlocks(owner, currentHashes, nextHashes) {
       state: 'prepared',
       pendingManagedBlocks: nextHashes,
     };
+  if (topApplied) meta.topApplied = topApplied;
+  owner[OWNER_META_KEY] = meta;
 }
 
 function finalizeManagedBlocks(owner) {
@@ -325,19 +421,8 @@ function finalizeManagedBlocks(owner) {
     version: OWNER_META_VERSION,
     state: 'installed',
     managedBlocks: meta.pendingManagedBlocks,
+    ...(meta.topApplied ? { topApplied: meta.topApplied } : {}),
   };
-}
-
-/** 去掉受管块（以及用户同名顶层行）之后，剩下的用户内容按「顶层区 / 表区」切开 */
-function splitUserLines(found, drop) {
-  const firstHeader = found.lines.findIndex((line) => line.isHeader);
-  const head = [];
-  const tail = [];
-  found.lines.forEach((line, index) => {
-    if (found.inBlock(index) || drop.has(index)) return;
-    (firstHeader >= 0 && index >= firstHeader ? tail : head).push(line.raw);
-  });
-  return { head: trimBlankRuns(head), tail: trimBlankRuns(tail) };
 }
 
 /** 掐掉首尾空行，中间连续的 3+ 空行压成一行 */
@@ -401,12 +486,14 @@ export function createCodexTarget(overrides = {}) {
       }
       if (found.starts.length !== 2) return { written: false, models: [] };
       const record = await readOwnerRecord(ownerPath());
-      if (!record.valid || !hasManagedSnapshot(found, record.owner)) return { written: false, models: [] };
+      // 只认「provider 表块仍是快照记录的那份」：顶层块的值被用户改过不影响「我们写过」
+      let at;
       try {
-        assertNoUnmanagedTopKeys(found, file);
+        at = locateBlocks(found, file);
       } catch {
         return { written: false, models: [] };
       }
+      if (!record.valid || !providerBlockIntact(found, record.owner, at.provider)) return { written: false, models: [] };
       const catalog = await readFileOrNone(catalogPath());
       let models = [];
       try {
@@ -428,50 +515,56 @@ export function createCodexTarget(overrides = {}) {
       const found = scan((await readFileOrNone(file)) ?? '', file);
       const record = await readOwnerRecord(ownerPath());
       if (!record.valid) throw configError(file, '对应的安装前原值快照已损坏');
-      const hasBlocks = found.starts.length > 0;
-      let owner = {};
-      let drop = new Set();
+      const catalogFile = catalogPath();
+      const at = locateBlocks(found, file);
+      const previousMeta = record.owner?.[OWNER_META_KEY];
+      const appliedModel = previousMeta?.topApplied?.model ?? null;
+      const priorOriginals = Object.fromEntries(TOP_KEYS
+        .filter((key) => typeof record.owner?.[key] === 'string')
+        .map((key) => [key, record.owner[key]]));
       let currentHashes = null;
-      if (hasBlocks) {
-        assertManagedSnapshot(found, record.owner, file);
-        assertNoUnmanagedTopKeys(found, file);
-        owner = record.owner;
-        currentHashes = hashManagedBlocks(found);
-      } else {
-        const current = takeUserTopLines(found, file);
-        const previous = record.owner;
-        const previousMeta = previous[OWNER_META_KEY];
-        const priorOriginals = Object.fromEntries(TOP_KEYS
-          .filter((key) => typeof previous[key] === 'string')
-          .map((key) => [key, previous[key]]));
-        const hasPriorSnapshot = Object.keys(priorOriginals).length > 0;
-        const hasInstalledSnapshot = record.present
-          && (previousMeta?.state === 'installed' || (!previousMeta && hasPriorSnapshot));
-        if (hasInstalledSnapshot) {
-          const unchanged = TOP_KEYS.every((key) => current.originals[key] === priorOriginals[key]);
-          if (!unchanged) {
-            throw configError(file, '里的受管标记已丢失，且顶层值与快照不一致；为避免把受管值误当成你的原值，本次没有覆盖配置');
-          }
+      if (found.starts.length > 0) {
+        if (!record.present) throw configError(file, '对应的安装前原值快照缺失');
+        // provider 表块是纯我们的地盘：被改过就报错，不覆盖用户接手的内容
+        if (at.provider >= 0 && !providerBlockIntact(found, record.owner, at.provider)) {
+          throw configError(file, '里的受管 provider 表已被改动；为避免覆盖你可能已经接手的内容，本次没有重写它');
         }
-        owner = previousMeta?.state === 'prepared' ? {} : priorOriginals;
-        Object.assign(owner, current.originals);
-        drop = current.drop;
+        // 顶层块被用户改过：能逐行分清「我们的 / 你的」才继续；旧快照没记 model 写入值时分不清，报错
+        if (at.top >= 0 && !topBlockIntact(found, record.owner, at.top) && appliedModel === null) {
+          throw configError(file, '里的受管顶层块已被改动，且旧版快照没有记录我们写入的取值；为避免误删你的改动，本次没有重写它');
+        }
+        currentHashes = hashManagedBlocks(found);
+      }
+      const owner = previousMeta?.state === 'prepared' ? {} : priorOriginals;
+      // 顶层区重排：用户的同名顶层行（块外的、以及顶层块里被用户改过的）吸收为应还原原值
+      const layout = collectTopArea(found, { topBlockIdx: at.top, appliedModel, catalogFile, file });
+      const installedBefore = record.present
+        && (previousMeta?.state === 'installed' || (!previousMeta && Object.keys(priorOriginals).length > 0));
+      for (const [key, raw] of layout.userTopKeys) {
+        if (raw === priorOriginals[key]) continue; // 与原值档同款，用户没动过
+        const value = quotedValue({ raw, commentOnly: false, key });
+        const isOurs = key === 'model'
+          ? appliedModel !== null && value === appliedModel
+          : value === PROVIDER_ID || value === catalogFile;
+        if (isOurs) continue; // 行值是我们写的（标记被删后残留），不能当成用户原值
+        if (installedBefore && key === 'model' && appliedModel === null) {
+          throw configError(file, '里的受管标记已丢失，且顶层 model 取值与快照对不上；为避免把受管值误当成你的原值，本次没有覆盖配置');
+        }
+        owner[key] = raw;
       }
       assertNoProviderConflict(found, file);
-      const { head, tail } = splitUserLines(found, drop);
-      const catalogFile = catalogPath();
       // 拼接顺序有讲究：顶层块必须在第一个表头之前，provider 表放在用户表区之前
       const next = [
         topBlockLines(models, catalogFile).join('\n'),
-        head.join('\n'),
+        trimBlankRuns(layout.kept).join('\n'),
         providerBlockLines({ port, apiKey }).join('\n'),
-        tail.join('\n'),
+        trimBlankRuns(tableAreaLines(found)).join('\n'),
       ]
         .filter((section) => section.trim())
         .join('\n\n');
       const expected = scan(next, file);
       if (expected.starts.length !== 2) throw configError(file, '无法确认本次生成的受管块');
-      savePendingManagedBlocks(owner, currentHashes, hashManagedBlocks(expected));
+      savePendingManagedBlocks(owner, currentHashes, hashManagedBlocks(expected), { model: models[0].id });
       await writeOwnerSnapshot(ownerPath(), owner);
       const catalogWrite = await writeTextIfChanged(catalogFile, catalogPayload(models));
       const write = await writeTextIfChanged(file, `${next}\n`);
@@ -488,13 +581,30 @@ export function createCodexTarget(overrides = {}) {
       if (!found.starts.length) return { removed: 0, changed: false };
       const record = await readOwnerRecord(ownerPath());
       if (!record.valid) throw configError(file, '对应的安装前原值快照已损坏');
-      assertManagedSnapshot(found, record.owner, file);
-      assertNoUnmanagedTopKeys(found, file);
+      const at = locateBlocks(found, file);
+      if (!record.present) throw configError(file, '对应的安装前原值快照缺失');
       const owner = record.owner;
-      const { head, tail } = splitUserLines(found, new Set());
-      const restored = TOP_KEYS.map((key) => owner[key]).filter((line) => typeof line === 'string');
-      const headLines = [...restored, ...head];
-      const body = [trimBlankRuns(headLines).join('\n'), tail.join('\n')].filter((part) => part.trim()).join('\n\n');
+      const meta = owner[OWNER_META_KEY];
+      const appliedModel = meta?.topApplied?.model ?? null;
+      // provider 表块被改过 → 报错不摘（纯我们的地盘，被改说明用户接手了）
+      if (at.provider >= 0 && !providerBlockIntact(found, owner, at.provider)) {
+        throw configError(file, '里的受管 provider 表已被改动；为避免删掉你可能已经接手的内容，本次没有摘除它');
+      }
+      // 顶层块被改过且旧快照没记 model 写入值 → 分不清哪行是我们的，报错
+      if (at.top >= 0 && !topBlockIntact(found, owner, at.top) && appliedModel === null) {
+        throw configError(file, '里的受管顶层块已被改动，且旧版快照没有记录我们写入的取值；请手工删掉 oc-faucet 标记块后再试');
+      }
+      const layout = collectTopArea(found, { topBlockIdx: at.top, appliedModel, catalogFile: catalogPath(), file });
+      // 条件还原：用户自己写着该键（块外或块内改过）→ 保留用户的值；只有空位才还原安装前原值
+      const restored = [];
+      for (const key of TOP_KEYS) {
+        if (layout.userTopKeys.has(key)) continue;
+        if (typeof owner[key] === 'string') restored.push(owner[key]);
+      }
+      const headLines = trimBlankRuns([...restored, ...layout.userTopKeys.values(), ...layout.kept]);
+      const body = [headLines.join('\n'), trimBlankRuns(tableAreaLines(found)).join('\n')]
+        .filter((part) => part.trim())
+        .join('\n\n');
       const write = await writeTextIfChanged(file, body ? `${body}\n` : '');
       await writeOwnerSnapshot(ownerPath(), {});
       await rm(catalogPath(), { force: true });
