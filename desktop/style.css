@@ -925,6 +925,17 @@ code {
   font-size: 12.5px;
 }
 
+/* 档位下拉与输入框同款外观；自定义档才亮出输入框（hidden 属性控制显隐） */
+.context-window-select {
+  padding: 5px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--card-2);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 12.5px;
+}
+
 .context-window-input:focus {
   outline: 2px solid var(--accent-soft);
   border-color: var(--accent);

@@ -346,6 +346,67 @@ test('编辑草稿经快照刷新保留，失败可重试，保存与恢复传�
   assert.equal(document.getElementById('notice').textContent, '已恢复上游默认上下文窗口');
 });
 
+test('上下文窗口档位下拉：预设即存、默认即恢复、自定义亮出输入框', async () => {
+  const app = bootRenderer();
+  const { document, calls, testApi } = app;
+  const rows = document.getElementById('rows');
+  // 预热：mock 的第一次保存会挂起等 reject，先把它消耗掉，之后的保存立即成功
+  const warmup = app.window.oc.setModelContextWindow('warmup', null).catch(() => {});
+  app.rejectFirstSave(new Error('warmup'));
+  await warmup;
+  testApi.setSnapshot(app.latestState);
+  testApi.toggle('opencode/demo');
+
+  // 无覆盖值：默认档、输入框隐藏
+  let select = byClass(rows, 'context-window-select')[0];
+  let input = byClass(rows, 'context-window-input')[0];
+  assert.equal(select.value, 'default');
+  assert.equal(input.hidden, true);
+
+  // 选预设：立即按预设值保存
+  select.value = '512000';
+  await select.dispatch('change')[0];
+  assert.deepEqual(calls.at(-1), { id: 'opencode/demo', value: 512000 });
+
+  // 切自定义：输入框出现并聚焦；输入走原有保存按钮链路
+  select = byClass(rows, 'context-window-select')[0];
+  input = byClass(rows, 'context-window-input')[0];
+  select.value = 'custom';
+  await select.dispatch('change')[0];
+  input = byClass(rows, 'context-window-input')[0];
+  assert.equal(input.hidden, false);
+  assert.equal(document.activeElement, input);
+  assert.equal(byClass(rows, 'context-window-select')[0].value, 'custom');
+  input.value = '300k';
+  input.dispatch('input');
+  const save = [...rows.querySelectorAll('button')].find((button) => button.textContent === '保存');
+  await save.dispatch('click')[0];
+  assert.deepEqual(calls.at(-1), { id: 'opencode/demo', value: 300000 });
+
+  // 选「默认」：等同恢复默认（null）
+  select = byClass(rows, 'context-window-select')[0];
+  select.value = 'default';
+  await select.dispatch('change')[0];
+  assert.deepEqual(calls.at(-1), { id: 'opencode/demo', value: null });
+});
+
+test('上下文窗口档位下拉：非预设存量值回填为自定义档并显示原值', async () => {
+  const app = bootRenderer();
+  const { document, testApi } = app;
+  const rows = document.getElementById('rows');
+  testApi.setSnapshot({
+    ...app.latestState,
+    models: app.latestState.models.map((model) => ({ ...model, contextWindowOverride: 777000 })),
+  });
+  testApi.toggle('opencode/demo');
+
+  const select = byClass(rows, 'context-window-select')[0];
+  const input = byClass(rows, 'context-window-input')[0];
+  assert.equal(select.value, 'custom', '777000 不在预设里 → 自定义档');
+  assert.equal(input.hidden, false);
+  assert.equal(input.value, '777000');
+});
+
 test('清除另一动作的错误不应取消已有成功提示的自动消失', () => {
   const app = bootRenderer();
   const { testApi, document, runTimers } = app;

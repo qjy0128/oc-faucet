@@ -735,6 +735,14 @@ function upstreamContextWindowText(value) {
   }
 }
 
+/** 档位下拉的预设窗口。口径与 parseContextWindow 一致：k=1,000、m=1,000,000（十进制）。 */
+const WINDOW_PRESETS = [
+  { value: 128000, label: '128k' },
+  { value: 256000, label: '256k' },
+  { value: 512000, label: '512k' },
+  { value: 1000000, label: '1m' },
+];
+
 /** 展开详情里的上下文窗口编辑器；草稿单独保存，轮询快照不会覆盖用户输入。 */
 function contextWindowEditor(model) {
   let draft = contextWindowDrafts.get(model.id);
@@ -744,6 +752,7 @@ function contextWindowEditor(model) {
       error: '',
       saving: false,
       dirty: false,
+      preset: null,
     };
     contextWindowDrafts.set(model.id, draft);
   }
@@ -756,6 +765,29 @@ function contextWindowEditor(model) {
 
   const label = h('label', 'context-window-label');
   const inputId = `context-window-${encodeURIComponent(model.id)}`;
+  const current = Number.isSafeInteger(model.contextWindowOverride) ? model.contextWindowOverride : null;
+
+  // 档位下拉：默认 / 预设几档 / 自定义（自定义时才出现输入框）。口径与
+  // parseContextWindow 一致（k=1,000、m=1,000,000，十进制）。
+  const select = h('select', 'context-window-select');
+  select.id = `${inputId}-preset`;
+  select.dataset.modelId = model.id;
+  // 保存中锁下拉：草稿在途被删重建的话，此刻切档会写到过期对象上、随后被回填覆盖
+  select.disabled = draft.saving;
+  for (const [value, text] of [
+    ['default', '默认'],
+    ...WINDOW_PRESETS.map((preset) => [String(preset.value), preset.label]),
+    ['custom', '自定义'],
+  ]) {
+    const option = h('option', '', text);
+    option.value = value;
+    select.append(option);
+  }
+  const currentPreset = current == null
+    ? 'default'
+    : (WINDOW_PRESETS.some((preset) => preset.value === current) ? String(current) : 'custom');
+  select.value = draft.dirty && draft.preset ? draft.preset : currentPreset;
+
   const input = h('input', 'context-window-input');
   input.id = inputId;
   input.dataset.modelId = model.id;
@@ -766,11 +798,12 @@ function contextWindowEditor(model) {
   input.disabled = draft.saving;
   input.value = draft.value;
   input.placeholder = '例如 200k 或 1m';
+  input.hidden = select.value !== 'custom';
   input.setAttribute('aria-describedby', `${inputId}-hint ${inputId}-error`);
   label.htmlFor = inputId;
-  label.append(h('span', '', '上下文窗口大小'), input);
+  label.append(h('span', '', '上下文窗口大小'), select, input);
 
-  const hint = h('p', 'context-window-hint', '输入 token 数，可写整数、200k 或 1m；1m = 1,000,000 tokens。');
+  const hint = h('p', 'context-window-hint', '选档位立刻生效；切「自定义」后输入 token 数，可写整数、200k 或 1m（1m = 1,000,000）。');
   hint.id = `${inputId}-hint`;
   const error = h('p', 'context-window-error', draft.error);
   error.id = `${inputId}-error`;
@@ -780,7 +813,7 @@ function contextWindowEditor(model) {
   const actions = h('div', 'context-window-actions');
   const save = h('button', 'mini', draft.saving ? '正在保存…' : '保存');
   save.type = 'button';
-  save.disabled = draft.saving || isBusy() || !parseContextWindow(draft.value);
+  save.disabled = draft.saving || isBusy() || select.value !== 'custom' || !parseContextWindow(draft.value);
   save.addEventListener('click', () => saveContextWindow(model.id));
   const restore = h('button', 'mini', draft.saving ? '正在保存…' : '恢复默认');
   restore.type = 'button';
@@ -788,10 +821,41 @@ function contextWindowEditor(model) {
   restore.addEventListener('click', () => saveContextWindow(model.id, null));
   actions.append(save, restore);
 
+  select.addEventListener('change', () => {
+    if (select.value === 'custom') {
+      // 自定义：亮出输入框，预填当前生效值方便微调；之后的输入走原有保存按钮链路。
+      // 注意草稿要写 Map 里那份——预设保存成功后草稿会被删除重建，闭包这份可能已过期。
+      let live = contextWindowDrafts.get(model.id);
+      if (!live) {
+        live = {
+          value: current == null ? '' : String(current),
+          error: '',
+          saving: false,
+          dirty: true,
+          preset: 'custom',
+        };
+        contextWindowDrafts.set(model.id, live);
+      } else {
+        live.dirty = true;
+        live.preset = 'custom';
+        if (!live.value) live.value = current == null ? '' : String(current);
+      }
+      renderList();
+      const box = document.getElementById('rows');
+      const fresh = [...box.querySelectorAll('.context-window-input')]
+        .find((el) => el.dataset.modelId === model.id);
+      fresh?.focus({ preventScroll: true });
+      return;
+    }
+    // 默认 / 预设：选择即保存（默认 = 恢复上游自带窗口）。返回 promise 让测试能等完
+    return saveContextWindow(model.id, select.value === 'default' ? null : Number(select.value));
+  });
+
   input.addEventListener('input', () => {
     draft.value = input.value;
     draft.error = '';
     draft.dirty = true;
+    draft.preset = 'custom';
     error.hidden = true;
     save.disabled = draft.saving || isBusy() || !parseContextWindow(draft.value);
   });
@@ -816,7 +880,10 @@ async function saveContextWindow(id, value) {
 
   let nextValue = value;
   const action = beginAction(`context-window:${id}`);
-  if (value !== null) {
+  if (typeof value === 'number') {
+    // 档位下拉直接给的预设值，不再过文本解析
+    nextValue = Number.isSafeInteger(value) && value > 0 ? value : null;
+  } else if (value !== null) {
     nextValue = parseContextWindow(draft.value);
     if (nextValue === null) {
       draft.error = '请输入大于 0 的整数 token 数，例如 200k 或 1m（1m = 1,000,000）。';
