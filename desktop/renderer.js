@@ -2249,10 +2249,13 @@ async function checkForUpdates() {
   button.disabled = true;
   const action = beginAction('update:check');
   try {
-    const state = await call('检查更新', () => window.oc.checkForUpdates(), action);
-    if (!state) return;
+    // 更新器抛出的错误已自带完整的「检查更新失败：…」中文文案，
+    // 不走 call 的自动前缀——那会叠成两遍「检查更新失败：」
+    const state = await window.oc.checkForUpdates();
     if (state.status === 'up-to-date') note(`已是最新版本（${state.currentVersion}）`, 'ok', action);
     // 发现新版本时弹窗会由状态推送自动打开，这里不重复提示
+  } catch (error) {
+    note(String(error?.message ?? error), 'error', action);
   } finally {
     button.disabled = false;
   }

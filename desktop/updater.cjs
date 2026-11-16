@@ -4,6 +4,8 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 
 const RELEASE_API = 'https://api.github.com/repos/qjy0128/oc-faucet/releases/latest';
+/** GitHub 匿名 API 限流（403/429；共享出口 IP 尤其常见）时的回退通道：发布 feed 不走 API、没有限流 */
+const RELEASE_ATOM = 'https://github.com/qjy0128/oc-faucet/releases.atom';
 const CHECK_TIMEOUT_MS = 10_000;
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -15,6 +17,45 @@ function expectedAssetNames(version, platform, arch) {
     return [`OC.Faucet.Setup.${version}.exe`, `OC Faucet Setup ${version}.exe`];
   }
   return [];
+}
+
+/**
+ * 回退通道：releases.atom 里只有标题/链接/发布说明，没有资产清单。
+ * 下载地址按「gh 上传时空格转点」的发布命名规则拼；文件大小未知
+ * （size 留 NaN，下载的大小校验和进度条自动退化为按字节计数）。
+ */
+async function fetchLatestViaAtom({ fetchImpl, currentVersion, signal }) {
+  const response = await fetchImpl(RELEASE_ATOM, {
+    headers: { 'User-Agent': `OC-Faucet/${currentVersion}` },
+    signal,
+  });
+  if (!response.ok) throw new Error(`GitHub 返回 HTTP ${response.status}`);
+  const xml = await response.text();
+  const entry = /<entry>[\s\S]*?<\/entry>/.exec(xml)?.[0] ?? '';
+  const link = /<link[^>]*href="([^"]*\/releases\/tag\/([^"]+))"/.exec(entry);
+  if (!link) throw new Error('发布流里读不到最新版本');
+  const latest = semver.clean(decodeURIComponent(link[2]));
+  if (!latest) throw new Error('GitHub 最新发布的版本号无效');
+  const notesHtml = /<content[^>]*>([\s\S]*?)<\/content>/.exec(entry)?.[1] ?? '';
+  return {
+    latest,
+    releaseUrl: link[1],
+    releaseNotes: atomText(notesHtml).trim() || '（发布说明见 GitHub 发布页）',
+  };
+}
+
+/** feed 里的说明是「XML 转义过的 HTML」：先还原两层转义再剥标签，够看就行，不做完整解析 */
+function atomText(xml) {
+  return decodeEntities(decodeEntities(String(xml))).replace(/<[^>]+>/g, ' ').replace(/[ \t]+/g, ' ');
+}
+
+function decodeEntities(text) {
+  return String(text)
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
 }
 
 /** 已有同名文件时退到「名字 (1).ext」，绝不覆盖用户自己的文件 */
@@ -105,43 +146,76 @@ function createUpdater(options) {
     try {
       const installed = semver.clean(currentVersion);
       if (!installed) throw new Error(`无法识别当前版本：${currentVersion}`);
-      const response = await fetchImpl(RELEASE_API, {
-        headers: {
-          Accept: 'application/vnd.github+json',
-          'User-Agent': `OC-Faucet/${installed}`,
-        },
-        signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
-      });
-      if (!response.ok) throw new Error(`GitHub 返回 HTTP ${response.status}`);
-      const latestRelease = await response.json();
-      const latest = semver.clean(latestRelease.tag_name ?? '');
-      if (!latest) throw new Error('GitHub 最新发布的版本号无效');
+      let latest;
+      let releaseUrl;
+      let releaseNotes = '';
+      let asset;
 
-      if (
-        latestRelease.draft ||
-        latestRelease.prerelease ||
-        semver.prerelease(latest) ||
-        !semver.gt(latest, installed)
-      ) {
-        candidate = null;
-        return setState({ status: 'up-to-date', latestVersion: latest });
+      try {
+        const response = await fetchImpl(RELEASE_API, {
+          headers: {
+            Accept: 'application/vnd.github+json',
+            'User-Agent': `OC-Faucet/${installed}`,
+          },
+          signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
+        });
+        if (!response.ok) throw new Error(`GitHub 返回 HTTP ${response.status}`);
+        const latestRelease = await response.json();
+        latest = semver.clean(latestRelease.tag_name ?? '');
+        if (!latest) throw new Error('GitHub 最新发布的版本号无效');
+
+        if (
+          latestRelease.draft ||
+          latestRelease.prerelease ||
+          semver.prerelease(latest) ||
+          !semver.gt(latest, installed)
+        ) {
+          candidate = null;
+          return setState({ status: 'up-to-date', latestVersion: latest });
+        }
+
+        const expectedNames = expectedAssetNames(latest, platform, arch);
+        const assets = Array.isArray(latestRelease.assets) ? latestRelease.assets : [];
+        const matches = assets.filter((item) => expectedNames.includes(item?.name));
+        if (matches.length !== 1) {
+          throw new Error(`新版本 ${latest} 没有适配 ${platform}/${arch} 的唯一安装包`);
+        }
+        asset = matches[0];
+        releaseUrl = latestRelease.html_url;
+        releaseNotes = typeof latestRelease.body === 'string' ? latestRelease.body : '';
+      } catch (apiError) {
+        // API 限流（403/429）或不可达：换发布 feed 再试一次；feed 也失败才认输报 API 的原始错误
+        const viaAtom = await fetchLatestViaAtom({
+          fetchImpl,
+          currentVersion: installed,
+          signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
+        }).catch(() => null);
+        if (!viaAtom) throw apiError;
+        if (!semver.gt(viaAtom.latest, installed)) {
+          candidate = null;
+          return setState({ status: 'up-to-date', latestVersion: viaAtom.latest });
+        }
+        const name = expectedAssetNames(viaAtom.latest, platform, arch)[0];
+        if (!name) throw new Error(`新版本 ${viaAtom.latest} 没有适配 ${platform}/${arch} 的安装包`);
+        latest = viaAtom.latest;
+        releaseUrl = viaAtom.releaseUrl;
+        releaseNotes = viaAtom.releaseNotes;
+        asset = {
+          name,
+          size: Number.NaN, // feed 里没有大小：下载的进度与大小校验自动退化为按字节计数
+          digest: null,
+          browser_download_url: `https://github.com/qjy0128/oc-faucet/releases/download/v${latest}/${encodeURIComponent(name)}`,
+        };
       }
 
-      const expectedNames = expectedAssetNames(latest, platform, arch);
-      const assets = Array.isArray(latestRelease.assets) ? latestRelease.assets : [];
-      const matches = assets.filter((item) => expectedNames.includes(item?.name));
-      if (matches.length !== 1) {
-        throw new Error(`新版本 ${latest} 没有适配 ${platform}/${arch} 的唯一安装包`);
-      }
-
-      candidate = { release: latestRelease, asset: matches[0], version: latest };
+      candidate = { release: { html_url: releaseUrl }, asset, version: latest };
       return setState({
         status: 'available',
         latestVersion: latest,
-        releaseUrl: latestRelease.html_url,
-        releaseNotes: typeof latestRelease.body === 'string' ? latestRelease.body : '',
-        assetName: matches[0].name,
-        totalBytes: Number.isSafeInteger(matches[0].size) ? matches[0].size : 0,
+        releaseUrl,
+        releaseNotes,
+        assetName: asset.name,
+        totalBytes: Number.isSafeInteger(asset.size) ? asset.size : 0,
         downloadedBytes: 0,
         filePath: null,
         launched: false,
@@ -149,7 +223,7 @@ function createUpdater(options) {
       });
     } catch (error) {
       // 查询失败不代表上次查到的新版作废：有候选就停在确认态，没有才回空闲。
-      // 抛出的中文错误由界面展示。
+      // 抛出的中文错误由界面展示（界面不再叠加前缀）。
       setState({ status: candidate ? 'available' : 'idle', error: null });
       throw new Error(`检查更新失败：${error.message}`, { cause: error });
     }

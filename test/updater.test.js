@@ -160,13 +160,71 @@ test('检查失败同样计入 24 小时节流，避免断网时反复请求', a
   });
 
   await assert.rejects(() => updater.checkForUpdates({ manual: true }), /检查更新失败/);
+  assert.equal(requests, 2, '一轮检查 = API 一次 + 限流回退 feed 一次');
   now += 3_600_000;
   assert.equal((await updater.checkForUpdates()).status, 'throttled');
-  assert.equal(requests, 1);
+  assert.equal(requests, 2);
 
   now += 86_400_000;
   await assert.rejects(() => updater.checkForUpdates(), /检查更新失败/);
-  assert.equal(requests, 2);
+  assert.equal(requests, 4);
+});
+
+/** releases.atom 的一个真实形状的最小副本（含 HTML 转义的发布说明） */
+function atomFeed(tag, title) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Release notes from oc-faucet</title>
+<entry><id>tag:github.com,2008:Repository/1/${tag}</id>
+<link rel="alternate" type="text/html" href="https://github.com/qjy0128/oc-faucet/releases/tag/${tag}"/>
+<title>${title}</title><content type="html">&lt;h2&gt;修复与amp;改进&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;修复更新检查&lt;/li&gt;&lt;/ul&gt;</content></entry></feed>`;
+}
+
+test('API 限流（403）时回退 releases.atom：照样发现新版、下载地址按规则拼', async (t) => {
+  const { updater } = await fixture(t, {
+    fetch: async (url) => {
+      if (url.includes('api.github.com')) return jsonResponse({ message: 'rate limited' }, 403);
+      if (url.includes('releases.atom')) {
+        return new Response(atomFeed('v1.0.4', 'OC Faucet 1.0.4'), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    },
+  });
+
+  const result = await updater.checkForUpdates({ manual: true });
+  assert.equal(result.status, 'available');
+  assert.equal(result.latestVersion, '1.0.4');
+  assert.equal(result.assetName, 'OC.Faucet-1.0.4-arm64.dmg', '资产名按 gh 上传的「空格转点」规则');
+  assert.equal(result.totalBytes, 0, 'feed 里没有大小，进度退化为按字节');
+  assert.match(result.releaseNotes, /修复更新检查/, '发布说明从 feed 的 HTML 剥成纯文本');
+  assert.equal(result.releaseUrl, 'https://github.com/qjy0128/oc-faucet/releases/tag/v1.0.4');
+});
+
+test('API 限流且回退 feed 也失败：报一次带原始状态的错，不叠前缀', async (t) => {
+  const { updater } = await fixture(t, {
+    fetch: async (url) => {
+      if (url.includes('api.github.com')) return jsonResponse({ message: 'rate limited' }, 403);
+      return new Response('', { status: 404 });
+    },
+  });
+
+  await assert.rejects(
+    () => updater.checkForUpdates({ manual: true }),
+    (error) => {
+      assert.equal(String(error.message).match(/检查更新失败/g)?.length, 1, '前缀只出现一次');
+      assert.match(error.message, /HTTP 403/);
+      return true;
+    },
+  );
+});
+
+test('API 限流回退 atom 且已是最新：结论与 API 路径一致', async (t) => {
+  const { updater } = await fixture(t, {
+    fetch: async (url) => {
+      if (url.includes('api.github.com')) return new Response('', { status: 429 });
+      return new Response(atomFeed('v1.0.3', 'OC Faucet 1.0.3'), { status: 200 });
+    },
+  });
+  assert.equal((await updater.checkForUpdates({ manual: true })).status, 'up-to-date');
 });
 
 test('没有更高版本或平台资产缺失时给出对应结论', async (t) => {
