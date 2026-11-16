@@ -282,12 +282,15 @@ test('面板与 Web 控制台：冷却标签、上下文上限设置与登录态
 
   let confirmAnswer = false;
   const savedPatches = [];
+  const updateCalls = [];
   let settingsState = {
     probeConcurrency: 3,
     probeTtlMinutes: 360,
     targetContextCap: 128000,
     shareOpencodeAuth: false,
+    opencodeAutoUpdate: true,
   };
+  let updateCheckResult = { status: 'latest', current: '2.3.0', latest: '2.3.0' };
   let snapshotState = {
     phase: 'ready',
     mode: 'embedded',
@@ -307,6 +310,7 @@ test('面板与 Web 控制台：冷却标签、上下文上限设置与登录态
     hiddenModels: [],
     blockedModels: [],
     targets: [],
+    opencodeUpdate: { enabled: true, version: '2.3.0', latest: '2.3.0', checkedAt: null, status: 'latest' },
   };
 
   const window = {
@@ -325,6 +329,20 @@ test('面板与 Web 控制台：冷却标签、上下文上限设置与登录态
       getApiKey: async () => ({ key: 'oc-key' }),
       getUpdateState: async () => ({ status: 'idle', currentVersion: '1.0.4' }),
       onUpdateState() {},
+      checkOpencodeUpdate: async () => {
+        updateCalls.push('check');
+        snapshotState.opencodeUpdate = {
+          ...snapshotState.opencodeUpdate,
+          ...updateCheckResult,
+          status: updateCheckResult.status,
+        };
+        return structuredClone(updateCheckResult);
+      },
+      applyOpencodeUpdate: async () => {
+        updateCalls.push('apply');
+        snapshotState.opencodeUpdate = { ...snapshotState.opencodeUpdate, version: updateCheckResult.latest, status: 'upgraded' };
+        return { status: 'upgraded', version: updateCheckResult.latest };
+      },
     },
   };
 
@@ -363,6 +381,28 @@ test('面板与 Web 控制台：冷却标签、上下文上限设置与登录态
   // loadSettings 回填登录态与自动更新开关（上下文上限的 UI 已移除）
   await ui.loadSettings();
   assert.equal(document.getElementById('cfg-share-auth').checked, false);
+
+  // 「检测 OpenCode 更新」按钮：已是最新 → 按钮旁就地提示，不进升级
+  updateCheckResult = { status: 'latest', current: '2.3.0', latest: '2.3.0' };
+  await document.getElementById('act-opencode-update').dispatch('click')[0];
+  assert.deepEqual(updateCalls, ['check']);
+  assert.match(document.getElementById('opencode-version').textContent, /v2\.3\.0 · 已是最新/);
+
+  // 有新版 → 确认后升级：升级接口被调、就地提示走到「已升级」
+  updateCalls.length = 0;
+  updateCheckResult = { status: 'available', current: '2.3.0', latest: '2.4.0' };
+  confirmAnswer = true;
+  await document.getElementById('act-opencode-update').dispatch('click')[0];
+  assert.deepEqual(updateCalls, ['check', 'apply']);
+  assert.match(document.getElementById('opencode-version').textContent, /v2\.4\.0 · 已升级/);
+
+  // 有新版 → 拒绝确认：不升级，提示留在「可更新到」
+  updateCalls.length = 0;
+  updateCheckResult = { status: 'available', current: '2.3.0', latest: '2.4.0' };
+  confirmAnswer = false;
+  await document.getElementById('act-opencode-update').dispatch('click')[0];
+  assert.deepEqual(updateCalls, ['check']);
+  assert.match(document.getElementById('opencode-version').textContent, /可更新到 v2\.4\.0/);
 
   // toggleShareAuth：取消确认自动回弹 checkbox 且不发请求；确认则保存 shareOpencodeAuth: true
   const patchCountBeforeShare = savedPatches.length;
