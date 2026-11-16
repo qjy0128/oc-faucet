@@ -1231,22 +1231,6 @@ code {
   margin-top: 8px;
 }
 
-.settings input.cap-input {
-  width: 104px;
-}
-
-/* 上下文上限的档位下拉：外观与同行的数字输入一致 */
-.settings select.cap-input {
-  width: 104px;
-  padding: 4px 8px;
-  border: 1px solid var(--line-strong);
-  border-radius: 7px;
-  background: var(--card);
-  color: var(--ink);
-  font-family: inherit;
-  font-size: 12.5px;
-}
-
 .settings input[type='number'] {
   width: 80px;
   padding: 4px 8px;

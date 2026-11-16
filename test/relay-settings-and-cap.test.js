@@ -177,9 +177,10 @@ test('面板与 Web 控制台：冷却标签、上下文上限设置与登录态
   const css = readFileSync(new URL('../desktop/style.css', import.meta.url), 'utf8');
   const webui = readFileSync(new URL('../src/webui.js', import.meta.url), 'utf8');
 
-  for (const id of ['cfg-context-cap-preset', 'cfg-context-cap', 'cfg-cap-save', 'cfg-share-auth']) {
+  for (const id of ['cfg-concurrency', 'cfg-ttl', 'cfg-share-auth', 'cfg-opencode-update']) {
     assert.ok(html.includes(`id="${id}"`), `desktop/index.html 缺少元素 #${id}`);
   }
+  assert.ok(!html.includes('cfg-context-cap'), '设置区的客户端上下文上限已按需求移除');
   assert.match(css, /\.settings \+ \.settings\s*\{/);
   assert.match(css, /\.tag-cool\s*\{/);
   // 检查 CSS 大括号成对，不存在残留断行
@@ -345,7 +346,7 @@ test('面板与 Web 控制台：冷却标签、上下文上限设置与登录态
   });
   ctx.globalThis = ctx;
   vm.runInContext(
-    `${rendererCode}\nglobalThis.__uiTest = { wire, loadSettings, saveSettings, saveContextCap, toggleShareAuth, receiveSnapshot };`,
+    `${rendererCode}\nglobalThis.__uiTest = { wire, loadSettings, saveSettings, toggleShareAuth, receiveSnapshot };`,
     ctx,
     { filename: 'desktop/renderer.js' },
   );
@@ -359,40 +360,9 @@ test('面板与 Web 控制台：冷却标签、上下文上限设置与登录态
   assert.equal(coolBadges.length, 1);
   assert.match(coolBadges[0].textContent, /冷却 \d+ 分/);
 
-  // loadSettings 回填：存量 128000 不在预设档里 → 落在「自定义」档并显示输入框
+  // loadSettings 回填登录态与自动更新开关（上下文上限的 UI 已移除）
   await ui.loadSettings();
-  assert.equal(document.getElementById('cfg-context-cap-preset').value, 'custom');
-  assert.equal(document.getElementById('cfg-context-cap').value, 128000);
-  assert.equal(document.getElementById('cfg-context-cap').hidden, false);
   assert.equal(document.getElementById('cfg-share-auth').checked, false);
-
-  // saveContextCap：自定义档非法值 500 标红且不调接口；合法值 65536 保存成功
-  document.getElementById('cfg-context-cap').value = '500';
-  await ui.saveContextCap();
-  assert.equal(document.getElementById('cfg-context-cap').getAttribute('aria-invalid'), 'true');
-  assert.equal(savedPatches.length, 0);
-
-  document.getElementById('cfg-context-cap').value = '65536';
-  await document.getElementById('cfg-cap-save').dispatch('click')[0];
-  assert.deepEqual(savedPatches.at(-1), { targetContextCap: 65536 });
-
-  // 预设档直接保存对应值；「默认」保存 null（不限制）
-  document.getElementById('cfg-context-cap-preset').value = '262144';
-  await document.getElementById('cfg-cap-save').dispatch('click')[0];
-  assert.deepEqual(savedPatches.at(-1), { targetContextCap: 262144 });
-  assert.equal(document.getElementById('cfg-context-cap').hidden, true, '预设档不显示输入框');
-
-  document.getElementById('cfg-context-cap-preset').value = 'default';
-  await document.getElementById('cfg-cap-save').dispatch('click')[0];
-  assert.deepEqual(savedPatches.at(-1), { targetContextCap: null });
-
-  // change 联动：切到「自定义」输入框出现；切回档位隐藏
-  document.getElementById('cfg-context-cap-preset').value = 'custom';
-  await document.getElementById('cfg-context-cap-preset').dispatch('change')[0];
-  assert.equal(document.getElementById('cfg-context-cap').hidden, false);
-  document.getElementById('cfg-context-cap-preset').value = '131072';
-  await document.getElementById('cfg-context-cap-preset').dispatch('change')[0];
-  assert.equal(document.getElementById('cfg-context-cap').hidden, true);
 
   // toggleShareAuth：取消确认自动回弹 checkbox 且不发请求；确认则保存 shareOpencodeAuth: true
   const patchCountBeforeShare = savedPatches.length;
