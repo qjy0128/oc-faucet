@@ -22,7 +22,7 @@
  * （测试用），调用时现读；createQoderTarget({ settingsPath }) /
  * createQoderCnTarget({ settingsPath }) 是另一条缝（测试/接线用）。
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -190,15 +190,27 @@ function createQoderSiteTarget(build, overrides = {}) {
     id: build.id,
     label: build.label,
 
-    /** 装没装：配置目录在，且已有的 settings.json 不是 JetBrains 插件留下的纯 enabledPlugins 文件 */
+    /**
+     * 装没装：配置目录在，且要么有 settings.json（且不是 JetBrains 插件留下的纯
+     * enabledPlugins 文件），要么目录里有 CLI 的真实使用痕迹。
+     * 只有一个 skills 目录或空目录不算——国际版和 CN 版目录完全独立，一些工具
+     * 会预建同名目录，按「目录存在」误判会让没装的那个发行版显示「可写入」。
+     */
     detect() {
       const file = resolvePath();
-      if (!existsSync(dirname(file))) return false;
-      if (!existsSync(file)) return true;
+      const dir = dirname(file);
+      if (!existsSync(dir)) return false;
+      if (existsSync(file)) {
+        try {
+          return !pluginOnlySettings(readFileSync(file, 'utf8'));
+        } catch {
+          return true; // 读不出来时不能断定是插件的文件
+        }
+      }
       try {
-        return !pluginOnlySettings(readFileSync(file, 'utf8'));
+        return readdirSync(dir).some((name) => name !== 'skills' && name !== '.DS_Store');
       } catch {
-        return true; // 读不出来时不能断定是插件的文件
+        return false;
       }
     },
 

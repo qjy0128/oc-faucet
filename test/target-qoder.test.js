@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -96,10 +96,16 @@ test('目标形状：id/label 符合契约，四个方法齐全', () => {
   }
 });
 
-test('detect：settings.json 所在目录（~/.qoder）在就算装了，不在就是没装', async (t) => {
+test('detect：目录里要有 CLI 的真实痕迹才算装了，空目录/只有 skills 不算', async (t) => {
   const { dir } = await withTempQoder(t, undefined);
   const target = createQoderTarget();
-  assert.equal(target.detect(), true, '配置目录存在');
+  assert.equal(target.detect(), false, '空目录不算（可能是别的工具预建的）');
+
+  await mkdir(join(dir, 'skills'), { recursive: true });
+  assert.equal(target.detect(), false, '只有一个 skills 目录也不算');
+
+  await mkdir(join(dir, '.auth'), { recursive: true });
+  assert.equal(target.detect(), true, '有 CLI 运行时痕迹（.auth 等）才算装了');
 
   process.env.OCF_QODER_SETTINGS = join(dir, 'nope', 'settings.json');
   assert.equal(target.detect(), false, '目录都没了才算没装');

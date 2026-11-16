@@ -999,10 +999,10 @@ function renderHiddenList() {
     for (const model of sorted) {
       const item = h('div', 'hidden-item');
       const meta = h('div', 'hidden-item-meta');
-      meta.append(
-        h('span', 'hidden-item-name', model.name || model.id),
-        h('span', 'hidden-item-id', model.inCatalog === false ? `${model.id}（手动规则 · 当前目录未返回）` : model.id),
-      );
+      // 只显示模型名称：列表里的映射 ID 是我们内部写进各工具的标识，
+      // 用户看到的工具菜单里并不会出现它，摆在这里只会添乱。
+      meta.append(h('span', 'hidden-item-name', model.name || model.id));
+      if (model.inCatalog === false) meta.append(h('span', 'hidden-item-id', '手动规则 · 当前目录未返回'));
       const restore = h('button', 'mini', blockingIds.has(model.id) ? '恢复中…' : '恢复显示');
       restore.type = 'button';
       restore.disabled = blockingIds.has(model.id);
