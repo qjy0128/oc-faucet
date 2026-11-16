@@ -23,7 +23,13 @@ import {
   parseModelId,
 } from './models.js';
 import { inspectOpencodeEnv } from './opencode-env.js';
-import { createAutoUpdater } from './opencode-update.js';
+import {
+  createAutoUpdater,
+  fetchLatestOpencodeVersion,
+  isNewerVersion,
+  readOpencodeVersion,
+  upgradeOpencode,
+} from './opencode-update.js';
 import { findOpencodeExecutable } from './oc-client.js';
 import { describeReasoning } from './efforts.js';
 import { PROBE_FINGERPRINT, probeMany } from './probe.js';
@@ -96,18 +102,12 @@ export class Bridge {
     // 上游客户端工厂：默认按方案造真的（内嵌 OpenCode / Bun 侧车直连 zen）；
     // makeClient 参数是留给测试的另一条缝（塞假客户端，不触网不起进程）
     this.#clientFactory = makeClient ?? ((mode, options) => this.#makeClient(mode, options));
-    // OpenCode 自动更新器：只在 embedded 方案下排期；state 挂到快照给面板显示
+    // OpenCode 更新巡检器：只在 embedded 方案下排期；发现新版只报告，
+    // 升级经面板「检测 OpenCode 更新」确认。state 挂到快照给面板显示
     this.#opencodeUpdater = createAutoUpdater({
-      locate: () => {
-        const explicit = this.client?.opencodePath ?? process.env.OCF_OPENCODE_PATH;
-        const { found } = findOpencodeExecutable(typeof explicit === 'string' && explicit ? explicit : undefined);
-        return found ? { path: found, explicit: typeof explicit === 'string' && Boolean(explicit) } : null;
-      },
+      locate: () => this.#locateOpencode(),
       isEnabled: async () => (await settings.readSettings()).opencodeAutoUpdate !== false,
       log: (line) => this.log(line),
-      onUpgraded: async () => {
-        await this.restart();
-      },
     });
     this.#inspectOpencode = inspectOpencode ?? inspectOpencodeEnv;
     // 失败自动重试的节奏（默认 30 分钟，避免后台静默探活频繁消耗共享免费池日限额；测试可调小）
@@ -269,6 +269,91 @@ export class Bridge {
 
   #clientFactory;
   #opencodeUpdater;
+  /** 手动检查/升级 OpenCode 与后台巡检互斥，避免同一次升级被触发两遍 */
+  #opencodeUpdateBusy = false;
+
+  /** 找本机 OpenCode 二进制；返回 { path, explicit } 或 null（explicit=用户显式指定过路径） */
+  #locateOpencode() {
+    const explicit = this.client?.opencodePath ?? process.env.OCF_OPENCODE_PATH;
+    const hasExplicit = typeof explicit === 'string' && Boolean(explicit);
+    const { found } = findOpencodeExecutable(hasExplicit ? explicit : undefined);
+    return found ? { path: found, explicit: hasExplicit } : null;
+  }
+
+  /**
+   * 手动检查 OpenCode 更新（面板「检测 OpenCode 更新」按钮）。
+   * 显式指定过路径的也允许查（只读版本），但不给升级入口。
+   * 返回 { status, current, latest }；status 与巡检状态同词表。
+   */
+  async checkOpencodeUpdate() {
+    if (this.#opencodeUpdateBusy) throw new BridgeError('OpenCode 更新正在进行的上一件事还没结束，请稍候。', 409, 'opencode_update_busy');
+    this.#opencodeUpdateBusy = true;
+    try {
+      const located = this.#locateOpencode();
+      const state = this.#opencodeUpdater.state;
+      if (!located?.path) {
+        state.status = 'not-found';
+        return { status: 'not-found', current: null, latest: null };
+      }
+      state.status = 'checking';
+      const [current, latest] = await Promise.all([
+        readOpencodeVersion(located.path),
+        fetchLatestOpencodeVersion(),
+      ]);
+      state.checkedAt = new Date().toISOString();
+      if (current) state.version = current;
+      if (latest) state.latest = latest;
+      if (!current || !latest) {
+        state.status = 'error';
+        return { status: 'error', current, latest };
+      }
+      if (located.explicit) {
+        state.status = 'manual-path';
+        return { status: 'manual-path', current, latest };
+      }
+      state.status = isNewerVersion(latest, current) ? 'available' : 'latest';
+      return { status: state.status, current, latest };
+    } finally {
+      this.#opencodeUpdateBusy = false;
+    }
+  }
+
+  /**
+   * 用户确认后升级 OpenCode（官方 opencode upgrade）并重启服务换新版。
+   * 显式指定过路径的拒绝——那是要尊重的用户选择。
+   */
+  async upgradeOpencodeNow() {
+    if (this.#opencodeUpdateBusy) throw new BridgeError('OpenCode 更新正在进行的上一件事还没结束，请稍候。', 409, 'opencode_update_busy');
+    const located = this.#locateOpencode();
+    if (!located?.path) throw new BridgeError('没有找到本机 OpenCode，无法升级。', 400, 'opencode_not_found');
+    if (located.explicit) {
+      throw new BridgeError(
+        'OpenCode 路径是你手动指定的（OCF_OPENCODE_PATH），OC Faucet 不代你升级；请自行更新后再来。',
+        400,
+        'opencode_manual_path',
+      );
+    }
+    this.#opencodeUpdateBusy = true;
+    const state = this.#opencodeUpdater.state;
+    state.status = 'upgrading';
+    this.log('OpenCode 升级开始（官方 opencode upgrade）……');
+    try {
+      const result = await upgradeOpencode(located.path);
+      if (!result.ok) {
+        state.status = 'error';
+        this.log(`OpenCode 升级失败：${result.output || '没有输出'}`);
+        throw new BridgeError(`OpenCode 升级失败：${result.output || '没有输出'}`, 500, 'opencode_upgrade_failed');
+      }
+      const after = await readOpencodeVersion(located.path);
+      if (after) state.version = after;
+      state.status = 'upgraded';
+      this.log(`OpenCode 已升级到 ${state.version ?? '新版本'}，正在重启服务让它生效……`);
+    } finally {
+      this.#opencodeUpdateBusy = false;
+    }
+    await this.restart();
+    return { status: 'upgraded', version: state.version };
+  }
   #inspectOpencode;
   #opencodeCheckedAt = 0;
   #opencodeCheckPromise = null;
@@ -373,9 +458,12 @@ export class Bridge {
       this.state.phase = 'ready';
       this.log(`OC Faucet 已就绪：转发口 http://127.0.0.1:${this.state.port}`);
       this.#startAutoRetry();
-      // 内嵌方案才有「升级本机 OpenCode」一说；先让服务跑起来，15 秒后再异步巡检，
-      // 有新版就自动升级并重启服务换新版（显式指定过路径的只提示不动手）。
-      if (this.state.mode === 'embedded') this.#opencodeUpdater.schedule(15_000);
+      // 内嵌方案才有「更新本机 OpenCode」一说：先读一次本机版本让面板常显，
+      // 15 秒后再异步巡检（发现新版只报告，升级经面板确认）。
+      if (this.state.mode === 'embedded') {
+        void this.#opencodeUpdater.refreshVersion();
+        this.#opencodeUpdater.schedule(15_000);
+      }
 
       // 端口先开着，再用缓存里的体检结论把模型恢复出来（不发请求、不花额度）。
       // 放在 listen 之后：这一步要问上游，失败了也不该让端口起不来。

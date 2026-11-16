@@ -95,44 +95,37 @@ test('createAutoUpdater：已是最新 → 不升级不重启', async () => {
   assert.deepEqual(events, []);
 });
 
-test('createAutoUpdater：有新版 → 升级、复核版本、回调重启', async () => {
+test('createAutoUpdater：有新版 → 只报告 available，不升级不重启（升级走面板确认）', async () => {
   const events = [];
-  let current = '2.3.0';
   const updater = createAutoUpdater({
     locate: () => ({ path: '/fake/opencode', explicit: false }),
-    readVersion: async () => current,
+    readVersion: async () => '2.3.0',
     fetchLatest: async () => '2.4.0',
-    upgrade: async () => { current = '2.4.0'; return { ok: true, output: 'upgraded' }; },
-    onUpgraded: async () => { events.push('restart'); },
     log: (line) => events.push(line),
     intervalMs: 60_000,
   });
   updater.schedule(0);
   await new Promise((resolve) => setTimeout(resolve, 50));
   updater.cancel();
-  assert.equal(updater.state.status, 'upgraded');
-  assert.equal(updater.state.version, '2.4.0');
-  assert.ok(events.includes('restart'), '升级成功后要回调重启');
-  assert.equal(events.filter((item) => item === 'restart').length, 1, '重启只回调一次');
-  assert.ok(events.some((item) => String(item).includes('已自动升级到 2.4.0')), '日志说明升级结果');
+  assert.equal(updater.state.status, 'available');
+  assert.equal(updater.state.version, '2.3.0', '本机版本不被巡检改动');
+  assert.equal(updater.state.latest, '2.4.0');
+  assert.ok(events.some((line) => String(line).includes('检测 OpenCode 更新')), '日志指到面板确认入口');
 });
 
-test('createAutoUpdater：升级失败 → 记错误、不重启、下一轮照常排期', async () => {
-  const events = [];
+test('createAutoUpdater：refreshVersion 只读本机版本，不触网不升级', async () => {
+  let fetched = false;
   const updater = createAutoUpdater({
     locate: () => ({ path: '/fake/opencode', explicit: false }),
-    readVersion: async () => '2.3.0',
-    fetchLatest: async () => '2.4.0',
-    upgrade: async () => ({ ok: false, output: 'network down' }),
-    onUpgraded: async () => { events.push('restart'); },
+    readVersion: async () => '2.5.1',
+    fetchLatest: async () => { fetched = true; return '9.9.9'; },
     log: () => {},
-    intervalMs: 10,
+    intervalMs: 60_000,
   });
-  updater.schedule(0);
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  updater.cancel();
-  assert.equal(updater.state.status, 'error');
-  assert.deepEqual(events, []);
+  await updater.refreshVersion();
+  assert.equal(updater.state.version, '2.5.1');
+  assert.equal(fetched, false, 'refreshVersion 不查最新版');
+  assert.equal(updater.state.status, 'idle', '状态仍留给巡检去写');
 });
 
 test('createAutoUpdater：开关关闭 / 显式路径 / 找不到二进制 → 各自的状态、零动作', async (t) => {

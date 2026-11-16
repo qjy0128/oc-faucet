@@ -121,6 +121,9 @@
     setModelContextWindow: (id, value) => post('/api/models/context-window', { id, value }),
     setModelBlocked: (id, blocked = true) => post('/api/models/block', { id, blocked }),
     checkOpencodeEnv: () => post('/api/opencode/check'),
+    // OpenCode 更新：检测（对照 npm 最新版）与确认后的升级
+    checkOpencodeUpdate: () => post('/api/opencode/update-check'),
+    applyOpencodeUpdate: () => post('/api/opencode/update-apply'),
     openOpencodeInstall: async () => ({ url: 'https://opencode.ai', opened: false }),
     // 密钥只在显式请求时经带令牌接口返回，快照里没有（工单 05）
     getApiKey: () => api('/api/key'),

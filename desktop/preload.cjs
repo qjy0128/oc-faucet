@@ -42,6 +42,9 @@ contextBridge.exposeInMainWorld('oc', {
   setModelContextWindow: (id, value) => invokeClean('oc:set-model-context-window', { id, value }),
   setModelBlocked: (id, blocked = true) => invokeClean('oc:set-model-blocked', { id, blocked }),
   checkOpencodeEnv: () => invokeClean('oc:check-opencode'),
+  // OpenCode 更新：检测（对照 npm 最新版）与确认后的升级（官方 upgrade + 重启服务）
+  checkOpencodeUpdate: () => invokeClean('oc:check-opencode-update'),
+  applyOpencodeUpdate: () => invokeClean('oc:apply-opencode-update'),
   openOpencodeInstall: () => invokeClean('oc:open-opencode-install'),
   // 密钥读改：返回形状与 Web 版一致（{key} / {ok:true}）
   getApiKey: () => invokeClean('oc:get-api-key'),

@@ -7,10 +7,11 @@
  * 下载与替换（含回滚旧版）都由它自己处理。
  *
  * 安全边界（每一条都有讲究）：
- *   - 显式指定过 OpenCode 路径（OCF_OPENCODE_PATH / opencodePath）的不自动升级：
+ *   - 巡检只对照版本、只报告；升级一律经用户在面板上确认后手动触发；
+ *   - 显式指定过 OpenCode 路径（OCF_OPENCODE_PATH / opencodePath）的不碰：
  *     那是用户自己挑的版本，动它之前应该先问用户；
- *   - 只在服务就绪后异步跑，升级成功后由调用方重启服务让新版生效（运行中的
- *     隔离进程用的是旧映像，Unix 下替换文件不影响它，不会中途坏掉）；
+ *   - 升级成功后由调用方重启服务让新版生效（运行中的隔离进程用的是旧映像，
+ *     Unix 下替换文件不影响它，不会中途坏掉）；
  *   - 任何一步失败都不影响正在运行的服务：记状态、下一轮（24 小时后）再试。
  */
 import { spawn } from 'node:child_process';
@@ -133,24 +134,25 @@ export function upgradeOpencode(binPath, { timeoutMs = UPGRADE_TIMEOUT_MS } = {}
 }
 
 /**
- * 造一个自动更新器。main.js 只负责接线：locate 找二进制、isEnabled 读设置、
- * onUpgraded 重启服务。所有依赖都从这里注入，测试不触网不起真进程。
+ * 造一个巡检器。main.js 只负责接线：locate 找二进制、isEnabled 读设置。
+ * 所有依赖都从这里注入，测试不触网不起真进程。
+ *
+ * 只检查、只报告：发现新版记 status='available'，升级动作统一由用户在面板上
+ * 经「检测 OpenCode 更新」确认后触发（见 main.js 的 upgradeOpencodeNow）。
  *
  * state 直接挂在返回对象上（面板快照透出）：
  *   enabled      设置开关（只读镜像，以设置文件为准）
  *   version      本机版本 / latest 最新版（读不到为 null）
  *   checkedAt    上次检查时间
  *   status       idle | off | manual-path | not-found | checking | latest
- *                | upgrading | upgraded | error
+ *                | available | upgrading | upgraded | error
  */
 export function createAutoUpdater({
   locate,
   isEnabled = async () => true,
   readVersion = readOpencodeVersion,
   fetchLatest = fetchLatestOpencodeVersion,
-  upgrade = upgradeOpencode,
   log = () => {},
-  onUpgraded = null,
   intervalMs = CHECK_INTERVAL_MS,
 } = {}) {
   const state = { enabled: null, version: null, latest: null, checkedAt: null, status: 'idle' };
@@ -193,31 +195,13 @@ export function createAutoUpdater({
       state.checkedAt = new Date().toISOString();
       if (!state.version || !state.latest) {
         state.status = 'error';
-        log(`OpenCode 自动更新这一轮没查成（本机 ${state.version ?? '？'}，最新 ${state.latest ?? '？'}），下一轮再试。`);
+        log(`OpenCode 版本这一轮没查成（本机 ${state.version ?? '？'}，最新 ${state.latest ?? '？'}），稍后再试。`);
         return;
       }
-      if (!isNewerVersion(state.latest, state.version)) {
-        state.status = 'latest';
-        return;
-      }
-      state.status = 'upgrading';
-      log(`OpenCode 有新版 ${state.latest}（本机 ${state.version}），正在自动升级……`);
-      const result = await upgrade(located.path);
-      if (!result.ok) {
-        state.status = 'error';
-        log(`OpenCode 自动升级失败：${result.output || '没有输出'}。服务继续用当前版本，下一轮再试。`);
-        return;
-      }
-      const after = await readVersion(located.path);
-      state.version = after ?? state.version;
-      state.status = 'upgraded';
-      log(`OpenCode 已自动升级到 ${state.version}，重启服务后生效。`);
-      if (typeof onUpgraded === 'function') {
-        try {
-          await onUpgraded();
-        } catch (error) {
-          log(`升级后重启服务失败：${error?.message ?? error}。请在面板上手动重启一次。`);
-        }
+      // 只报告，不自动升：升级动作统一走面板「检测 OpenCode 更新」按钮的确认流程
+      state.status = isNewerVersion(state.latest, state.version) ? 'available' : 'latest';
+      if (state.status === 'available') {
+        log(`OpenCode 有新版 ${state.latest}（本机 ${state.version}）。到「说明与设置」里点「检测 OpenCode 更新」确认升级。`);
       }
     } finally {
       busy = false;
@@ -229,7 +213,14 @@ export function createAutoUpdater({
   return {
     state,
     schedule,
-    /** 停掉后续排期（服务停了就不该再有动作）；正在跑的升级让它自然结束 */
+    /** 只读本机版本填进状态（不触网），给面板常显当前版本用；找不到或读不出就保持原样 */
+    async refreshVersion() {
+      const located = locate?.();
+      if (!located?.path) return;
+      const version = await readVersion(located.path);
+      if (version) state.version = version;
+    },
+    /** 停掉后续排期（服务停了就不该再有动作）；正在跑的检查让它自然结束 */
     cancel() {
       stopped = true;
       if (timer) {

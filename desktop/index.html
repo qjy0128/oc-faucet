@@ -155,9 +155,10 @@
               zen 免费池、把自己伪装成 OpenCode 客户端，是内嵌被卡死时的保底。
             </p>
             <p class="foot-note">
-              「自动更新 OpenCode」只作用于内嵌方案：对照 npm 上的最新版，有新版就用官方
-              opencode upgrade 升级本机那份 OpenCode，成功后自动重启服务换新版。伪装方案不运行
-              OpenCode，没有可升级的；OC Faucet 应用自身的更新走上面的「检查更新」。
+              OpenCode 更新只作用于内嵌方案：自动检查对照 npm 上的最新版，发现新版只提示；
+              点「检测 OpenCode 更新」确认后，才用官方 opencode upgrade 升级本机那份 OpenCode
+              并自动重启服务换新版。伪装方案不运行 OpenCode，没有可升级的；OC Faucet 应用
+              自身的更新走上面的「检查更新」。
             </p>
 
             <div class="settings">
@@ -177,10 +178,11 @@
                 <input id="cfg-share-auth" type="checkbox">
                 <span>复用本机 OpenCode 登录态（需重启服务）</span>
               </label>
-              <label class="check" title="服务就绪后定期对照 npm 上的最新版；有新版就用官方 opencode upgrade 自动升级并重启服务换新版。显式指定过 OpenCode 路径（OCF_OPENCODE_PATH）时不动它">
+              <label class="check" title="服务就绪后每 24 小时对照一次 npm 上的最新版，发现新版只提示、不自动升级；升级统一经「检测 OpenCode 更新」按钮确认。只作用于内嵌方案">
                 <input id="cfg-opencode-update" type="checkbox">
-                <span>自动更新 OpenCode<span id="opencode-version" class="hint"></span></span>
+                <span>自动检查 OpenCode 更新<span id="opencode-version" class="hint"></span></span>
               </label>
+              <button id="act-opencode-update" class="mini" type="button" title="立即对照 npm 上的最新版：已是最新就提示；有新版会先问你要不要升，确认后用官方 opencode upgrade 升级并自动重启服务">检测 OpenCode 更新</button>
             </div>
           </div>
         </details>

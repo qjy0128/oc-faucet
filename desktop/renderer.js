@@ -1478,7 +1478,7 @@ function applySnapshot(next) {
   return true;
 }
 
-/** 设置区「自动更新 OpenCode」后面的版本状态小字；状态语义见 src/opencode-update.js */
+/** 设置区「自动检查 OpenCode 更新」后面的版本状态小字；状态语义见 src/opencode-update.js */
 function renderOpencodeUpdateHint(update) {
   const el = byId('opencode-version');
   if (!el) return;
@@ -1488,13 +1488,63 @@ function renderOpencodeUpdateHint(update) {
   }
   const suffix = {
     latest: ' · 已是最新',
+    available: update.latest ? ` · 可更新到 v${update.latest}` : ' · 有新版',
     upgrading: update.latest ? ` → v${update.latest} · 升级中…` : ' · 升级中…',
-    upgraded: ` · 已升级`,
-    error: ' · 巡检失败，稍后再试',
-    off: ' · 自动更新已关',
-    'manual-path': ' · 手动指定路径，不自动更新',
+    upgraded: ' · 已升级',
+    error: ' · 检查失败，稍后再试',
+    off: ' · 自动检查已关',
+    'manual-path': ' · 手动指定路径，不代你升级',
   }[update.status] ?? '';
   el.textContent = `（v${update.version}${suffix}）`;
+}
+
+/**
+ * 「检测 OpenCode 更新」按钮：检测 → 已是最新直接提示 / 有新版先确认 → 确认后
+ * 升级（官方 opencode upgrade）并自动重启服务。全程按钮锁住显示进行中文案。
+ */
+async function checkOpencodeUpdateFlow(event) {
+  const button = event?.currentTarget ?? byId('act-opencode-update');
+  const idleLabel = button.textContent;
+  const action = beginAction('opencode:update');
+  const runLocked = async (label, fn) => {
+    button.disabled = true;
+    button.textContent = label;
+    try {
+      return await fn();
+    } finally {
+      button.disabled = false;
+      button.textContent = idleLabel;
+    }
+  };
+
+  const result = await runLocked('检测中…', () => call('检测 OpenCode 更新', () => window.oc.checkOpencodeUpdate(), action));
+  await refreshSnapshot();
+  if (!result) return;
+  if (result.status === 'latest') {
+    note(`OpenCode 已是最新（v${result.current}）`, 'ok', action);
+    return;
+  }
+  if (result.status === 'manual-path') {
+    note(`当前 v${result.current}，最新 v${result.latest}。OpenCode 路径是你手动指定的（OCF_OPENCODE_PATH），请自行更新。`, 'error', action);
+    return;
+  }
+  if (result.status !== 'available') {
+    note(`没查成 OpenCode 版本（本机 ${result.current ?? '？'}，最新 ${result.latest ?? '？'}），请稍后再试。`, 'error', action);
+    return;
+  }
+
+  const yes = typeof window.confirm === 'function'
+    ? window.confirm(`当前为 ${result.current} 版本，是否更新为 ${result.latest} 版本？\n\n升级用官方 opencode upgrade 完成，结束后会自动重启服务（端口、密钥和已写入的工具配置都不变）。`)
+    : true;
+  if (!yes) {
+    note(`已取消：OpenCode 留在 v${result.current}（可更新到 v${result.latest}）`, '', action);
+    return;
+  }
+
+  const applied = await runLocked('更新中…', () => call('升级 OpenCode', () => window.oc.applyOpencodeUpdate(), action));
+  await refreshSnapshot();
+  if (!applied) return;
+  note(`OpenCode 已更新到 v${applied.version ?? '新版本'}，服务已用新版本重启`, 'ok', action);
 }
 
 function handleWebConnectionError(error) {
@@ -1948,8 +1998,8 @@ async function toggleOpencodeUpdate() {
   }
   note(
     saved.opencodeAutoUpdate !== false
-      ? '已开启 OpenCode 自动更新：服务就绪后自动巡检新版，有就升级并重启服务。'
-      : '已关闭 OpenCode 自动更新，本机 OpenCode 保持当前版本。',
+      ? '已开启自动检查：每 24 小时对照一次最新版，发现新版只提示，升级经「检测 OpenCode 更新」确认。'
+      : '已关闭自动检查：OpenCode 保持当前版本，仍可随时点「检测 OpenCode 更新」手动查。',
     'ok',
     action,
   );
@@ -2295,6 +2345,7 @@ function wire() {
   }
   byId('cfg-share-auth').addEventListener('change', toggleShareAuth);
   byId('cfg-opencode-update').addEventListener('change', toggleOpencodeUpdate);
+  byId('act-opencode-update').addEventListener('click', checkOpencodeUpdateFlow);
 
   // 状态栏的 BaseURL 复制；转发口没起来时按钮是灰的，走不到这里
   byId('act-copy-endpoint').addEventListener('click', async (event) => {

@@ -27,6 +27,8 @@ const IPC_CHANNELS = [
   'oc:set-model-context-window',
   'oc:set-model-blocked',
   'oc:check-opencode',
+  'oc:check-opencode-update',
+  'oc:apply-opencode-update',
   'oc:open-opencode-install',
   'oc:get-api-key',
   'oc:set-api-key',
@@ -64,6 +66,30 @@ async function loadBridge() {
 
 function pathToFileURL(p) {
   return require('node:url').pathToFileURL(p);
+}
+
+/**
+ * 窗口（重新）打开时，服务若没在跑（上次停过 / 启动失败过），自动后台拉起。
+ * 幂等：starting / ready 一律跳过；体检不自动跑（要花额度），拉起目录即可用。
+ */
+async function ensureServiceRunning() {
+  if (!bridge || !bridge.snapshot) return;
+  let snap;
+  try {
+    snap = bridge.snapshot();
+  } catch {
+    return;
+  }
+  if (snap.phase !== 'idle' && snap.phase !== 'error') return;
+  console.log('[oc] 服务未在运行，自动后台启动');
+  try {
+    await bridge.start();
+    await bridge.refresh?.().catch(() => {});
+    pushState();
+  } catch (error) {
+    console.error('[oc] 自动启动服务失败：', error);
+    pushState();
+  }
 }
 
 /** macOS 的 Dock 图标：Electron 直跑不会自动用 icon.png，得显式设（其它平台用打包配置，跳过） */
@@ -258,6 +284,19 @@ function registerIpc() {
     return status;
   });
 
+  // OpenCode 更新：手动检测（对照 npm）与确认后的升级（官方 upgrade + 重启服务）
+  ipcMain.handle('oc:check-opencode-update', async () => {
+    const result = await bridge.checkOpencodeUpdate();
+    pushState();
+    return result;
+  });
+
+  ipcMain.handle('oc:apply-opencode-update', async () => {
+    const result = await bridge.upgradeOpencodeNow();
+    pushState();
+    return result;
+  });
+
   ipcMain.handle('oc:open-opencode-install', async () => {
     await shell.openExternal('https://opencode.ai');
     return { url: 'https://opencode.ai', opened: true };
@@ -393,6 +432,9 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
     else { win?.show(); win?.focus(); }
+    // 重开窗口时服务可能没在跑（上次停过/启动失败）：自动后台拉起，
+    // 避免接入工具因为没人监听端口而集体失灵
+    void ensureServiceRunning();
   });
 });
 

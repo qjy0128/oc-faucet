@@ -200,6 +200,10 @@ export async function startWebUi({
       return bridge.checkOpencodeEnv({ force: true });
     },
 
+    // OpenCode 更新：手动检测（对照 npm 最新版）与确认后的升级（官方 upgrade + 重启服务）
+    'POST /api/opencode/update-check': async () => bridge.checkOpencodeUpdate(),
+    'POST /api/opencode/update-apply': async () => bridge.upgradeOpencodeNow(),
+
     // 重启 / 关闭整个服务。和其它动作接口一样，必须带令牌。
     // 关闭属于正常停止：onStop 收摊前会把各接入目标里我们写入的配置一并摘除。
     'POST /api/restart': async () => {
