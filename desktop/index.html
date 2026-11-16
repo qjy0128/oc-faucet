@@ -149,6 +149,16 @@
               耗时是整轮请求的用时，不是首字延迟。额度剩多少上游不告诉我们，这里也查不到。
               没通过检测的模型只留在这个窗口里看，不会写进任何工具。
             </p>
+            <p class="foot-note">
+              上游有两种方案，随时可切（端口、密钥、已写入的工具配置都不动）：内嵌把本机安装的
+              OpenCode 拉起来当模型入口，跑在完全隔离的目录里；伪装由随应用打包的 Bun 侧车直连
+              zen 免费池、把自己伪装成 OpenCode 客户端，是内嵌被卡死时的保底。
+            </p>
+            <p class="foot-note">
+              「自动更新 OpenCode」只作用于内嵌方案：对照 npm 上的最新版，有新版就用官方
+              opencode upgrade 升级本机那份 OpenCode，成功后自动重启服务换新版。伪装方案不运行
+              OpenCode，没有可升级的；OC Faucet 应用自身的更新走上面的「检查更新」。
+            </p>
 
             <div class="settings">
               <label for="cfg-concurrency">检测并发</label>
