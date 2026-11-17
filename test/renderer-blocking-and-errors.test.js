@@ -512,6 +512,29 @@ test('启动 OpenCode 环境提示：未安装时顶部横幅与一次性弹窗�
   await app.document.getElementById('opencode-banner-retry').dispatch('click')[0];
   assert.equal(app.getCalls().opencodeCheckCalls, 1);
 
+  // 3b) 只装了桌面版、没有 CLI -> 黄色横幅点名「内嵌还需要 CLI」，不再笼统说已安装
+  const desktopOnlyState = {
+    ...missingState,
+    phase: 'ready',
+    error: null,
+    errorCode: null,
+    upstream: { ready: true, baseUrl: 'http://127.0.0.1:4096' },
+    opencode: { installed: true, cliInstalled: false, appInstalled: true, externalRunning: false, installUrl: 'https://opencode.ai' },
+  };
+  app.setState(desktopOnlyState);
+  app.api.receiveSnapshot(structuredClone(desktopOnlyState));
+  assert.equal(banner.hidden, false);
+  assert.equal(banner.classList.contains('is-warning'), true);
+  assert.match(app.document.getElementById('opencode-banner-title').textContent, /桌面版.*CLI|CLI.*桌面版/);
+  assert.match(app.document.getElementById('opencode-banner-desc').textContent, /伪装/);
+
+  // 3c) 有 CLI -> 回到常规「已安装未打开」的温和提示
+  app.setState(closedState);
+  app.api.receiveSnapshot(structuredClone(closedState));
+  assert.equal(banner.classList.contains('is-info'), true);
+  assert.match(app.document.getElementById('opencode-banner-title').textContent, /已安装.*未打开/);
+
+
   // 外部 OpenCode 启动后，顶部警告横幅自动隐藏
   const openedState = {
     ...closedState,

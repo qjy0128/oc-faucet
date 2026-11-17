@@ -128,6 +128,35 @@ const PORT_PATTERNS = [
   /port[^0-9]{0,12}(\d{2,5})/i,
 ];
 
+/**
+ * 桌面版安装提示：找不到 CLI 但检测到桌面版时，给一句说人话的指引。
+ * 判据与 opencode-env.js 的 defaultDesktopPaths 保持一致（两边各自维护，
+ * 避免 oc-client ↔ opencode-env 循环 import）。
+ */
+function desktopAppHint() {
+  const home = homedir();
+  const candidates = process.platform === 'win32'
+    ? [
+      join(process.env.LOCALAPPDATA ?? join(home, 'AppData', 'Local'), 'Programs', 'OpenCode', 'OpenCode.exe'),
+      join(process.env.LOCALAPPDATA ?? join(home, 'AppData', 'Local'), 'OpenCode', 'OpenCode.exe'),
+      join(process.env.ProgramFiles ?? 'C:\\Program Files', 'OpenCode', 'OpenCode.exe'),
+    ]
+    : process.platform === 'darwin'
+      ? ['/Applications/OpenCode.app', join(home, 'Applications', 'OpenCode.app')]
+      : [];
+  try {
+    if (candidates.some((candidate) => existsSync(candidate))) {
+      return '检测到 OpenCode 桌面版：内嵌方案要拉起的是 CLI 子进程，桌面版代替不了。'
+        + (process.platform === 'win32'
+          ? '在 PowerShell 执行 irm https://opencode.ai/install.ps1 | iex（或 npm i -g @opencode/cli）安装 CLI 后重试，或继续使用伪装方案。'
+          : '到 opencode.ai 按官方脚本安装 CLI 后重试，或继续使用伪装方案。');
+    }
+  } catch {
+    /* 检测不到就算了，别拦住原本的报错 */
+  }
+  return null;
+}
+
 /** 给需要直接检测安装位置的模块暴露一份入口（保持 discoverOpencode 自身内部声明形式不变）。 */
 export function findOpencodeExecutable(explicit, pathEnv = process.env.PATH ?? '', home = homedir(), platform = process.platform) {
   return discoverOpencode(explicit, pathEnv, home, platform);
@@ -874,7 +903,7 @@ export class OcClient {
     if (!found) {
       throw new BridgeError(
         `找不到 OpenCode 程序。我依次找过这些地方：${searched.join('、')}。` +
-          `请确认已经装好 OpenCode，或者用环境变量 OCF_OPENCODE_PATH 直接告诉 OC Faucet 它在哪。`,
+          `${desktopAppHint() ?? ''}请确认已经装好 OpenCode CLI，或者用环境变量 OCF_OPENCODE_PATH 直接告诉 OC Faucet 它在哪。`,
         500,
         'runtime_missing',
       );

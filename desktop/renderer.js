@@ -1063,6 +1063,21 @@ function renderOpencodeBanner() {
     return;
   }
 
+  // 只装了桌面版、没有 CLI：内嵌方案起不来（要的是 CLI 可执行文件），
+  // 别再笼统说「已安装」——那会让人以为切内嵌没问题，切了才报错
+  if (oc.cliInstalled !== true && oc.appInstalled === true) {
+    banner.className = 'opencode-banner is-warning';
+    banner.hidden = false;
+    title.textContent = '检测到 OpenCode 桌面版，但内嵌方案还需要 CLI 版';
+    desc.textContent = snapshot.mode === 'masquerade'
+      ? '当前「伪装」方案不受影响，可继续使用。想用「内嵌」方案的话，请再安装 CLI 版（Windows 在 PowerShell 执行 irm https://opencode.ai/install.ps1 | iex，或 npm i -g @opencode/cli），装好点「重新检测」。'
+      : '内嵌方案要拉起 OpenCode CLI 子进程，桌面版代替不了。请在 PowerShell 执行 irm https://opencode.ai/install.ps1 | iex（或 npm i -g @opencode/cli）安装 CLI 后点「重新检测」，或先切换到「伪装」方案直接使用。';
+    installBtn.hidden = false;
+    switchBtn.hidden = snapshot.mode === 'masquerade';
+    dismissBtn.hidden = false;
+    return;
+  }
+
   if (!externalRunning) {
     if (opencodeWarningDismissed) {
       banner.hidden = true;
