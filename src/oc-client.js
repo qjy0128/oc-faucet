@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import net from 'node:net';
 import { BridgeError } from './errors.js';
 import { classifyUpstreamError, extractRetryAfterMsFromBody } from './cooldown.js';
@@ -104,7 +104,7 @@ function detectOpencodeMajor(found) {
     child.stdout?.on('data', (chunk) => { output = `${output}${chunk}`.slice(-4_000); });
     child.stderr?.on('data', (chunk) => { output = `${output}${chunk}`.slice(-4_000); });
     child.once('error', (error) => {
-      finish(new BridgeError(`读取 OpenCode 版本失败：${error.message}。请确认 ${found} 能正常执行。`, 500, 'runtime_missing'));
+      finish(new BridgeError(`读取 OpenCode 版本失败：${error.message}（路径 ${found}）。请确认这个文件能正常执行；若是 Windows 商店/winget 的执行别名，请改装真 CLI 或用 OCF_OPENCODE_PATH 指到真身。`, 500, 'runtime_missing'));
     });
     child.once('exit', (code) => {
       const match = /\bv?(\d+)\.\d+(?:\.\d+)?/.exec(output);
@@ -129,8 +129,8 @@ const PORT_PATTERNS = [
 ];
 
 /** 给需要直接检测安装位置的模块暴露一份入口（保持 discoverOpencode 自身内部声明形式不变）。 */
-export function findOpencodeExecutable(explicit, pathEnv = process.env.PATH ?? '', home = homedir()) {
-  return discoverOpencode(explicit, pathEnv, home);
+export function findOpencodeExecutable(explicit, pathEnv = process.env.PATH ?? '', home = homedir(), platform = process.platform) {
+  return discoverOpencode(explicit, pathEnv, home, platform);
 }
 
 /**
@@ -142,16 +142,21 @@ export function findOpencodeExecutable(explicit, pathEnv = process.env.PATH ?? '
  * @param {string|undefined} explicit
  * @returns {{found: string|null, searched: string[]}}
  */
-function discoverOpencode(explicit, pathEnv = process.env.PATH ?? '', home = homedir()) {
+function discoverOpencode(explicit, pathEnv = process.env.PATH ?? '', home = homedir(), platform = process.platform) {
   const searched = [];
   const named = (value) => typeof value === 'string' && value.length > 0;
-  const windows = process.platform === 'win32';
+  const windows = platform === 'win32';
 
-  const tryFile = (candidate) => {
+  const tryFile = (candidate, { allowAlias = false } = {}) => {
     if (!named(candidate)) return null;
     searched.push(candidate);
     // Windows 的 X_OK 只看文件是否存在，无扩展名的 bash shim 必须在这里挡掉
     if (windows && !/\.(?:exe|cmd|bat)$/i.test(candidate)) return null;
+    // Windows 的「应用执行别名」（winget/商店装的 CLI 在 %LOCALAPPDATA%\Microsoft\WindowsApps
+    // 下的 0 字节 reparse point）不是真可执行映象：spawn 只会得到 UNKNOWN（nodejs/node#21825
+    // 一族），自动发现时必须跳过它继续找 PATH 里后面的真身。
+    // 显式指定的路径不受此过滤——用户指哪是哪，spawn 失败时错误文案会带上路径指因。
+    if (windows && !allowAlias && /[\\/]Microsoft[\\/]WindowsApps[\\/]/.test(candidate)) return null;
     try {
       accessSync(candidate, constants.X_OK);
       return candidate;
@@ -160,19 +165,20 @@ function discoverOpencode(explicit, pathEnv = process.env.PATH ?? '', home = hom
     }
   };
 
-  // 1) 显式指定
-  const explicitHit = tryFile(explicit);
+  // 1) 显式指定（用户指哪是哪，不走执行别名过滤）
+  const explicitHit = tryFile(explicit, { allowAlias: true });
   if (explicitHit) return { found: explicitHit, searched };
 
-  // 2) 环境变量
-  const envHit = tryFile(process.env.OCF_OPENCODE_PATH);
+  // 2) 环境变量（同样是用户显式指定的）
+  const envHit = tryFile(process.env.OCF_OPENCODE_PATH, { allowAlias: true });
   if (envHit) return { found: envHit, searched };
 
   // 3) 家目录下的默认安装位置
   const homeHit = tryFile(join(home, '.opencode', 'bin', windows ? 'opencode.exe' : 'opencode'));
   if (homeHit) return { found: homeHit, searched };
 
-  const pathDirs = pathEnv.split(delimiter).filter(named);
+  // PATH 的分隔符按被测平台走：在 mac 上模拟 Windows 分支时也得切 ';'
+  const pathDirs = pathEnv.split(windows ? ';' : ':').filter(named);
   if (windows) {
     // npm 的外层 .cmd 只是启动器，真身在包内。所有目录先找 exe，再回退批处理。
     const npmRoots = named(process.env.APPDATA) ? [join(process.env.APPDATA, 'npm'), ...pathDirs] : pathDirs;
