@@ -13,6 +13,7 @@ import { randomBytes } from 'node:crypto';
 import { rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { BridgeError } from './errors.js';
+import { buildSystem } from './envelope.js';
 
 /** 探测口径版本号。探测逻辑变了必须改这个（改了旧缓存自动作废）。
  *  v2（2026-10-23）：回合内真调过本机工具（被审批拦下）也算 tool——转交链路上线后
@@ -262,21 +263,34 @@ function abortReason(signal) {
   return new BridgeError('体检超时：模型没有在限定时间内回话', 504, 'probe_timeout');
 }
 
-/** 体检用的系统提示。只给一个 read 工具，并要求按信封格式回复。 */function buildProbeSystem({ filePath, fileName }) {
+/**
+ * 体检给 read 工具的申报（OpenAI 形状，与真实客户端进转发口的形状一致）。
+ * 必须走 buildSystem 的「可用外部工具清单」通道、而不是只写在提示词文字里——
+ * 严格派模型（如 GLM-5.3-Flash）只认清单，清单空就会拒绝调用并被冤枉成「只能聊天」；
+ * 真实场景里客户端都会带 tools，清单从来不空（实测带清单后同一模型完全可用）。
+ */
+const PROBE_READ_TOOL = Object.freeze({
+  type: 'function',
+  function: {
+    name: 'read',
+    description: '读取本机文件的内容',
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string', description: '文件的绝对路径' },
+      },
+      required: ['filePath'],
+    },
+  },
+});
+
+/** 体检用的系统提示：与真实客户端同款的信封（含工具清单），再补靶子文件的约束。 */
+function buildProbeSystem({ filePath, fileName }) {
   return [
-    '你正在接受一次自动化能力探测。请严格按下面的信封协议回复。',
+    buildSystem({ tools: [PROBE_READ_TOOL], flavor: 'anthropic', providerName: '能力探测' }),
     '',
-    '你有且只有一个外部工具：',
-    `- read：读取本机文件。参数 {"filePath":"文件的绝对路径"}`,
-    '',
-    '回复必须是**一个 JSON 对象**，不要 Markdown 代码围栏，不要在 JSON 前后写任何解释：',
-    '{"content":"给用户的文字，可为空串","calls":[{"name":"工具名","arguments":{}}]}',
-    '',
-    '规则：',
-    '1. calls 里只放你“请求调用”的工具，不要假装它们已经执行，也不要编造执行结果。',
-    '2. 工具名与参数名必须逐字照抄上面的写法，不许换成相似名字，不许调用不存在的工具。',
-    '3. 不需要调用工具时，calls 给空数组。',
-    `4. 本次唯一可用的目标文件是 ${fileName}（绝对路径 ${filePath}），不要猜别的路径。`,
+    '本次能力探测的补充约束：',
+    `- 唯一可用的目标文件是 ${fileName}（绝对路径 ${filePath}），不要猜别的路径。`,
   ].join('\n');
 }
 
