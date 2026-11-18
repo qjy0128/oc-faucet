@@ -2249,7 +2249,15 @@ function receiveUpdateState(state) {
     clearNotice('update:check');
   }
   const version = byId('app-version');
-  if (state.currentVersion) version.textContent = `版本 ${state.currentVersion}`;
+  if (state.currentVersion) {
+    // 就地反馈：结论直接缀在版本号后面——顶部 note 会被存活错误吞掉、且 6 秒即逝
+    const suffix = state.status === 'up-to-date'
+      ? ' · 已是最新'
+      : state.status === 'available' && state.latestVersion
+        ? ` · 有新版 v${state.latestVersion}`
+        : '';
+    version.textContent = `版本 ${state.currentVersion}${suffix}`;
+  }
   renderUpdateDialog(state);
 }
 
@@ -2261,18 +2269,24 @@ async function startUpdateDownload() {
 
 async function checkForUpdates() {
   const button = byId('act-check-update');
+  const idleLabel = button.textContent;
+  const version = byId('app-version');
+  const baseVersion = version.textContent;
   button.disabled = true;
+  button.textContent = '检测中…';
   const action = beginAction('update:check');
   try {
     // 更新器抛出的错误已自带完整的「检查更新失败：…」中文文案，
     // 不走 call 的自动前缀——那会叠成两遍「检查更新失败：」
     const state = await window.oc.checkForUpdates();
     if (state.status === 'up-to-date') note(`已是最新版本（${state.currentVersion}）`, 'ok', action);
-    // 发现新版本时弹窗会由状态推送自动打开，这里不重复提示
+    // 发现新版本时弹窗会由状态推送自动打开，版本 hint 也会就地标「有新版」
   } catch (error) {
+    version.textContent = `${baseVersion} · 检查失败，稍后再试`;
     note(String(error?.message ?? error), 'error', action);
   } finally {
     button.disabled = false;
+    button.textContent = idleLabel;
   }
 }
 
