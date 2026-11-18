@@ -614,7 +614,7 @@ function renderList() {
     state.dataset.state = spinning ? 'wait' : verdictKey(model);
     state.append(h('span', 'dot'), h('span', '', spinning ? '检测中…' : verdictText(model)));
     // 悬停看上游原始报错：「不可用 / 只能聊天」这类结论太短，原因在 note 里
-    if (!spinning && model.note && verdictKey(model) !== 'ok') state.title = model.note;
+    if (!spinning && model.note && verdictKey(model) !== 'ok') state.title = stripNotePrefixes(model.note);
 
     // 耗时
     const timing = h('span', 'timing', timingText(model));
@@ -664,8 +664,32 @@ function toggle(id) {
   renderList();
 }
 
+/**
+ * 剥掉 note 上层叠的流程性前缀（「体检失败：」「模型这次报错了：」等），
+ * 只留真正有信息量的上游原文。前缀由多层代码各自拼接，展示时统一剥干净。
+ */
+function stripNotePrefixes(note) {
+  let text = String(note ?? '');
+  for (;;) {
+    const next = text
+      .replace(/^体检失败[:：]\s*/, '')
+      .replace(/^模型这次报错了[:：]\s*/, '')
+      .replace(/^上游说明[:：]\s*/, '')
+      .replace(/^上游返回错误[:：]\s*/, '');
+    if (next === text) return text;
+    text = next;
+  }
+}
+
 function detailBlock(model) {
   const wrap = h('div', 'row-detail');
+
+  // 失败/聊天的原因放最顶上——用户展开就是为了看它，别让它沉到详情最底部
+  const verdict = verdictKey(model);
+  if (verdict !== 'ok' && model.note) {
+    const label = verdict === 'chat' ? '判定说明' : '失败原因';
+    wrap.append(h('p', 'detail-note', `${label}：${stripNotePrefixes(model.note)}`));
+  }
 
   const grid = h('div', 'detail-grid');
   const field = (key, value) => {
@@ -697,8 +721,6 @@ function detailBlock(model) {
   // 推理参数片段：两种请求格式各一段可复制；没档位的模型整块不显示
   const efforts = effortBlock(model);
   if (efforts) wrap.append(efforts);
-
-  if (model.note) wrap.append(h('p', 'detail-note', `上游说明：${model.note}`));
 
   const tools = h('div', 'detail-actions');
   const again = h('button', '', '只重测这一个');
