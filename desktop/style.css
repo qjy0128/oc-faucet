@@ -1199,6 +1199,15 @@ code {
   color: var(--muted);
 }
 
+/* 展开方向指示：默认朝下（可展开），展开后翻转朝上（再点收起） */
+.foot-info summary .chevron {
+  transition: transform 0.15s ease;
+}
+
+.foot-info details[open] > summary .chevron {
+  transform: rotate(180deg);
+}
+
 .foot-body {
   padding: 4px 0 14px;
   display: flex;

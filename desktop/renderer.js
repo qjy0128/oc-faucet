@@ -613,6 +613,8 @@ function renderList() {
     const state = h('span', 'state');
     state.dataset.state = spinning ? 'wait' : verdictKey(model);
     state.append(h('span', 'dot'), h('span', '', spinning ? '检测中…' : verdictText(model)));
+    // 悬停看上游原始报错：「不可用 / 只能聊天」这类结论太短，原因在 note 里
+    if (!spinning && model.note && verdictKey(model) !== 'ok') state.title = model.note;
 
     // 耗时
     const timing = h('span', 'timing', timingText(model));
