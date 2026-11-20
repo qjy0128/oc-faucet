@@ -149,6 +149,13 @@ export function prepareAnthropic(body, models) {
           });
           break;
         }
+        case 'thinking':
+        case 'redacted_thinking': {
+          // 模型自己的思考记录（thinking 带签名、redacted_thinking 是脱敏串），跟 Responses 侧
+          // 的 reasoning 一样不含用户内容，跳过即可。塞回上游既浪费 token，又把上一轮的
+          // 私密推理喂给下一个模型。ZCode 开了推理档位后会把它回传，这里必须放行而不是拒绝。
+          break;
+        }
         default:
           throw new BridgeError(
             `${at}的类型是「${String(type)}」，本桥还不支持这种内容块（目前只支持 text / image / tool_use / tool_result）。` +
@@ -376,6 +383,12 @@ export function prepareOpenAI(body, models) {
             name: fn.name,
             arguments: parseArgumentsLoose(fn.arguments, at),
           });
+          break;
+        }
+        case 'thinking':
+        case 'redacted_thinking':
+        case 'reasoning': {
+          // 同 Anthropic 侧：模型自己的思考记录，不含用户内容，跳过，不当正文喂给上游。
           break;
         }
         default:

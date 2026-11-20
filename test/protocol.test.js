@@ -204,14 +204,54 @@ test('prepareAnthropic：tool_result 的 content 支持数组块', () => {
   assert.equal(history[0].content, '第一行\n第二行');
 });
 
-test('prepareAnthropic：不支持的块（thinking 等）明确报错', () => {
-  const error = throwsBridge(() =>
-    prepareAnthropic({ model: MODEL.id, messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: '嗯……' }] }] }, MODELS)
+test('prepareAnthropic：模型自己的 thinking / redacted_thinking 跳过，不当正文也不报错', () => {
+  // ZCode 开了推理档位后会把 thinking 块回传（报错原文就是这条路径）。它不含用户内容，
+  // 跟 Responses 侧的 reasoning 一样跳过；正文和工具调用必须照常保留。
+  const prepared = prepareAnthropic(
+    {
+      model: MODEL.id,
+      messages: [
+        { role: 'user', content: '问题' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: '嗯……', signature: 'sig_x' },
+            { type: 'text', text: '答' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'redacted_thinking', data: 'enc' },
+            { type: 'tool_use', id: 'tu_1', name: 'read', input: { file: 'a' } },
+          ],
+        },
+      ],
+    },
+    MODELS
   );
-  assert.equal(error.status, 400);
-  assert.equal(error.code, 'unsupported_content');
-  assert.match(error.message, /thinking/);
+  const history = JSON.parse(prepared.text.split('\n')[1]);
+  assert.deepEqual(
+    history.map((h) => [h.role, h.type, h.text ?? h.name]),
+    [
+      ['user', 'text', '问题'],
+      ['assistant', 'text', '答'],
+      ['assistant', 'tool_use', 'read'],
+    ]
+  );
+  assert.ok(!prepared.text.includes('嗯……'), '思考内容不能漏进上游提示词');
+  assert.ok(!prepared.text.includes('sig_x'), '签名不能漏进上游提示词');
+  assert.ok(!prepared.text.includes('enc'), '脱敏串不能漏进上游提示词');
 
+  // 整条消息只有 thinking：跳过后不留空壳，也不报错
+  const onlyThinking = prepareAnthropic(
+    { model: MODEL.id, messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: '只有思考' }] }, { role: 'user', content: '继续' }] },
+    MODELS
+  );
+  assert.deepEqual(JSON.parse(onlyThinking.text.split('\n')[1]), [{ role: 'user', type: 'text', text: '继续' }]);
+});
+
+test('prepareAnthropic：真正不认识的内容块仍明确报错', () => {
   assert.equal(
     throwsBridge(() => prepareAnthropic({ model: MODEL.id, messages: [{ role: 'user', content: [{ type: 'document', source: {} }] }] }, MODELS)).code,
     'unsupported_content'
@@ -375,6 +415,37 @@ test('prepareOpenAI：content 块形式的 tool_result 也认', () => {
   const history = JSON.parse(prepared.text.split('\n')[1]);
   assert.deepEqual(history[0].arguments, { path: 'a.txt', content: 'x' });
   assert.equal(history[1].content, '写入失败：权限不足');
+});
+
+test('prepareOpenAI：reasoning / thinking 块跳过，正文照常保留', () => {
+  const prepared = prepareOpenAI(
+    {
+      model: MODEL.id,
+      messages: [
+        { role: 'user', content: '问题' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', reasoning: '内部推理' },
+            { type: 'thinking', thinking: '嗯……' },
+            { type: 'text', text: '答' },
+          ],
+        },
+      ],
+    },
+    MODELS
+  );
+  const history = JSON.parse(prepared.text.split('\n')[1]);
+  assert.deepEqual(history, [
+    { role: 'user', type: 'text', text: '问题' },
+    { role: 'assistant', type: 'text', text: '答' },
+  ]);
+  assert.ok(!prepared.text.includes('内部推理'));
+  assert.ok(!prepared.text.includes('嗯……'));
+  assert.equal(
+    throwsBridge(() => prepareOpenAI({ model: MODEL.id, messages: [{ role: 'user', content: [{ type: 'mystery' }] }] }, MODELS)).code,
+    'unsupported_content'
+  );
 });
 
 test('prepareOpenAI：tool_choice 的字符串与函数形状', () => {
